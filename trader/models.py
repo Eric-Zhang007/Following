@@ -80,6 +80,7 @@ class OrderIntent:
     action_type: str
     symbol: str
     side: str
+    trade_side: str | None
     order_type: str
     quantity: float
     price: float | None

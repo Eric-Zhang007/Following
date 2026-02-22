@@ -13,13 +13,33 @@ bitget:
   api_secret: "YOUR_BITGET_API_SECRET"
   passphrase: "YOUR_BITGET_PASSPHRASE"
   product_type: "USDT-FUTURES"
+  margin_mode: "isolated"      # isolated / crossed
+  position_mode: "one_way_mode" # one_way_mode / hedge_mode
+  force: "gtc"                 # gtc / ioc / fok / post_only
 
+# Option A: ALLOWLIST (recommended conservative start)
 filters:
+  symbol_policy: "ALLOWLIST"
   symbol_whitelist: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "CYBERUSDT", "KITEUSDT"]
+  symbol_blacklist: []
+  require_exchange_symbol: true
+  min_usdt_volume_24h: null
   max_leverage: 10
   allow_sides: ["LONG", "SHORT"]
   max_signal_age_seconds: 20
   leverage_over_limit_action: "CLAMP"  # CLAMP or REJECT
+
+# Option B: ALLOW_ALL (for more symbols, incl. niche coins)
+# filters:
+#   symbol_policy: "ALLOW_ALL"
+#   symbol_whitelist: []
+#   symbol_blacklist: ["SCAMUSDT", "LOWLIQUSDT"]
+#   require_exchange_symbol: true
+#   min_usdt_volume_24h: 1000000
+#   max_leverage: 10
+#   allow_sides: ["LONG", "SHORT"]
+#   max_signal_age_seconds: 20
+#   leverage_over_limit_action: "CLAMP"
 
 risk:
   account_risk_per_trade: 0.005

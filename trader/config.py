@@ -21,10 +21,17 @@ class BitgetConfig(BaseModel):
     api_secret: str = ""
     passphrase: str = ""
     product_type: str = "USDT-FUTURES"
+    margin_mode: Literal["isolated", "crossed"] = "isolated"
+    position_mode: Literal["one_way_mode", "hedge_mode"] = "one_way_mode"
+    force: Literal["gtc", "ioc", "fok", "post_only"] = "gtc"
 
 
 class FiltersConfig(BaseModel):
+    symbol_policy: Literal["ALLOWLIST", "ALLOW_ALL"] = "ALLOWLIST"
     symbol_whitelist: list[str] = Field(default_factory=list)
+    symbol_blacklist: list[str] = Field(default_factory=list)
+    require_exchange_symbol: bool = True
+    min_usdt_volume_24h: float | None = None
     max_leverage: int = 10
     allow_sides: list[Literal["LONG", "SHORT"]] = Field(default_factory=lambda: ["LONG", "SHORT"])
     max_signal_age_seconds: int = 20
@@ -33,6 +40,11 @@ class FiltersConfig(BaseModel):
     @field_validator("symbol_whitelist")
     @classmethod
     def normalize_symbol_whitelist(cls, value: list[str]) -> list[str]:
+        return [v.strip().upper().replace("/", "") for v in value if v.strip()]
+
+    @field_validator("symbol_blacklist")
+    @classmethod
+    def normalize_symbol_blacklist(cls, value: list[str]) -> list[str]:
         return [v.strip().upper().replace("/", "") for v in value if v.strip()]
 
 

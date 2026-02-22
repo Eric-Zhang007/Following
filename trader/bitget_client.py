@@ -38,6 +38,36 @@ class BitgetClient:
                 return float(payload[key])
         raise RuntimeError(f"Ticker response missing price: {payload}")
 
+    def get_contracts(self) -> list[dict[str, Any]]:
+        data = self._request(
+            "GET",
+            "/api/v2/mix/market/contracts",
+            params={"productType": self.config.product_type},
+            auth=False,
+        )
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            if isinstance(data.get("list"), list):
+                return data["list"]
+            return [data]
+        return []
+
+    def get_tickers(self) -> list[dict[str, Any]]:
+        data = self._request(
+            "GET",
+            "/api/v2/mix/market/tickers",
+            params={"productType": self.config.product_type},
+            auth=False,
+        )
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            if isinstance(data.get("list"), list):
+                return data["list"]
+            return [data]
+        return []
+
     def get_account_equity(self) -> float:
         data = self._request(
             "GET",
@@ -79,19 +109,27 @@ class BitgetClient:
         order_type: str,
         price: float | None = None,
         reduce_only: bool = False,
+        trade_side: str | None = None,
         client_oid: str | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "symbol": symbol,
             "productType": self.config.product_type,
             "marginCoin": "USDT",
+            "marginMode": self.config.margin_mode,
             "side": side,
             "orderType": order_type.lower(),
             "size": f"{size:.6f}",
-            "reduceOnly": "YES" if reduce_only else "NO",
         }
+        if self.config.position_mode == "one_way_mode":
+            body["reduceOnly"] = "YES" if reduce_only else "NO"
+        elif trade_side:
+            body["tradeSide"] = trade_side
+
         if price is not None:
             body["price"] = f"{price:.8f}"
+        if order_type.lower() == "limit":
+            body["force"] = self.config.force
         if client_oid:
             body["clientOid"] = client_oid
 

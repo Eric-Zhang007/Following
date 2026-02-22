@@ -4,11 +4,13 @@ from datetime import datetime, timezone
 
 from trader.config import AppConfig
 from trader.models import EntrySignal, EntryType, ManageAction, RiskDecision
+from trader.symbol_registry import SymbolRegistry
 
 
 class RiskManager:
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(self, config: AppConfig, symbol_registry: SymbolRegistry | None = None) -> None:
         self.config = config
+        self.symbol_registry = symbol_registry
 
     def evaluate_entry(
         self,
@@ -21,8 +23,30 @@ class RiskManager:
         symbol = signal.symbol.upper()
         side = signal.side.value
 
-        if symbol not in self.config.filters.symbol_whitelist:
-            return RiskDecision.reject(f"symbol not in whitelist: {symbol}")
+        if symbol in self.config.filters.symbol_blacklist:
+            return RiskDecision.reject(f"symbol in blacklist: {symbol}")
+
+        if self.config.filters.symbol_policy == "ALLOWLIST":
+            if symbol not in self.config.filters.symbol_whitelist:
+                return RiskDecision.reject(f"symbol not in whitelist: {symbol}")
+        elif self.config.filters.symbol_policy == "ALLOW_ALL":
+            if self.config.filters.require_exchange_symbol:
+                if self.symbol_registry is None:
+                    return RiskDecision.reject("symbol registry unavailable while require_exchange_symbol=true")
+                if not self.symbol_registry.is_tradable(symbol):
+                    return RiskDecision.reject(f"symbol not tradable on Bitget USDT futures: {symbol}")
+        else:
+            return RiskDecision.reject(f"unsupported symbol policy: {self.config.filters.symbol_policy}")
+
+        min_volume = self.config.filters.min_usdt_volume_24h
+        if min_volume is not None:
+            if self.symbol_registry is None:
+                return RiskDecision.reject("symbol registry unavailable while min_usdt_volume_24h is enabled")
+            volume = self.symbol_registry.get_24h_volume(symbol)
+            if volume is None:
+                return RiskDecision.reject(f"24h volume unavailable for symbol: {symbol}")
+            if volume < min_volume:
+                return RiskDecision.reject(f"24h volume {volume:.2f} below threshold {min_volume:.2f} for {symbol}")
 
         if side not in self.config.filters.allow_sides:
             return RiskDecision.reject(f"side not allowed: {side}")

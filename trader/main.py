@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from dataclasses import asdict, is_dataclass
 from datetime import timezone
@@ -17,6 +18,7 @@ from trader.models import EntrySignal, ManageAction, NonSignal, ParsedMessage, u
 from trader.notifier import Notifier
 from trader.risk import RiskManager
 from trader.store import SQLiteStore
+from trader.symbol_registry import SymbolRegistry
 from trader.telegram_listener import TelegramListener
 
 app = typer.Typer(add_completion=False, help="Telegram signal -> Bitget executor")
@@ -58,9 +60,17 @@ async def _run_async(config_path: Path) -> None:
 
     store = SQLiteStore(config.storage.db_path)
     parser_engine = HybridSignalParser(config, store, logger)
-    risk_manager = RiskManager(config)
     bitget = BitgetClient(config.bitget)
-    executor = TradeExecutor(config, bitget, store, notifier, logger)
+    symbol_registry = SymbolRegistry(bitget, logger)
+    try:
+        symbol_registry.refresh(force=True)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Initial SymbolRegistry refresh failed: %s", exc)
+
+    risk_manager = RiskManager(config, symbol_registry=symbol_registry)
+    executor = TradeExecutor(config, bitget, store, notifier, logger, symbol_registry=symbol_registry)
+
+    refresh_task = asyncio.create_task(_symbol_registry_refresh_loop(symbol_registry, logger))
 
     logger.info(
         "Starting trader. dry_run=%s db=%s llm_mode=%s llm_enabled=%s",
@@ -211,6 +221,9 @@ async def _run_async(config_path: Path) -> None:
     try:
         await listener.run(on_telegram_event)
     finally:
+        refresh_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await refresh_task
         store.close()
 
 
@@ -305,6 +318,15 @@ def _below_confidence_threshold(config: AppConfig, outcome: ParseOutcome) -> boo
     if not config.llm.require_confirmation_below_threshold:
         return False
     return outcome.confidence < config.llm.confidence_threshold
+
+
+async def _symbol_registry_refresh_loop(registry: SymbolRegistry, logger: logging.Logger) -> None:
+    while True:
+        await asyncio.sleep(1800)
+        try:
+            registry.refresh(force=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Scheduled SymbolRegistry refresh failed: %s", exc)
 
 
 def main() -> None:
