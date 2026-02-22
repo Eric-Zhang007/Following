@@ -1,0 +1,56 @@
+dry_run: true
+
+telegram:
+  api_id: 123456
+  api_hash: "your_telegram_api_hash"
+  session_name: "ivan_listener"
+  channel: "@IvanCryptotalk"
+  notify_chat_id: null
+
+bitget:
+  base_url: "https://api.bitget.com"
+  api_key: "YOUR_BITGET_API_KEY"
+  api_secret: "YOUR_BITGET_API_SECRET"
+  passphrase: "YOUR_BITGET_PASSPHRASE"
+  product_type: "USDT-FUTURES"
+
+filters:
+  symbol_whitelist: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "CYBERUSDT", "KITEUSDT"]
+  max_leverage: 10
+  allow_sides: ["LONG", "SHORT"]
+  max_signal_age_seconds: 20
+  leverage_over_limit_action: "CLAMP"  # CLAMP or REJECT
+
+risk:
+  account_risk_per_trade: 0.005
+  max_notional_per_trade: 200
+  entry_slippage_pct: 0.3
+  cooldown_seconds: 300
+  default_stop_loss_pct: 1.0
+  assumed_equity_usdt: 1000
+
+logging:
+  level: "INFO"
+  file: "trader.log"
+  rich: true
+
+storage:
+  db_path: "trader.db"
+
+execution:
+  limit_price_strategy: "MID"  # MID/LOW/HIGH
+
+llm:
+  enabled: true
+  mode: "hybrid"  # rules_only / hybrid / llm_only
+  provider: "openai"
+  model: "YOUR_MODEL_NAME"
+  api_key_env: "OPENAI_API_KEY"
+  base_url: null
+  timeout_seconds: 15
+  max_retries: 2
+  confidence_threshold: 0.75
+  require_confirmation_below_threshold: true
+  redact_patterns:
+    - "(?i)api_key\\s*[:=]\\s*\\S+"
+    - "(?i)secret\\s*[:=]\\s*\\S+"
