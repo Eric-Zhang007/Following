@@ -14,6 +14,7 @@
 ```bash
 python -m venv .venv
 source .venv/bin/activate
+python -m pip install --upgrade pip setuptools wheel
 pip install -e .
 pip install -e .[dev]
 ```
