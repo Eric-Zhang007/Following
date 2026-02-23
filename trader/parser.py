@@ -13,6 +13,8 @@ ENTRY_RANGE_RE = re.compile(
 )
 REDUCE_RE = re.compile(r"减仓\s*(\d{1,3})(?:\s*[%％])?", re.IGNORECASE)
 TP_RE = re.compile(r"TP\s*\d*\s*(?:看|到|:|：)?\s*([0-9]*\.?[0-9]+)", re.IGNORECASE)
+STOP_RE = re.compile(r"(?:止损|SL)\s*[:：]?\s*([0-9]*\.?[0-9]+)", re.IGNORECASE)
+ENTRY_TP_RE = re.compile(r"(?:止盈|TP)\s*\d*\s*(?:看|到|:|：)?\s*([0-9]*\.?[0-9]+)", re.IGNORECASE)
 
 
 class SignalParser:
@@ -70,6 +72,9 @@ class SignalParser:
         leverage = int(leverage_match.group(1)) if leverage_match else None
 
         entry_type = EntryType.MARKET if "市价" in text else EntryType.LIMIT
+        stop_match = STOP_RE.search(text)
+        stop_loss = float(stop_match.group(1)) if stop_match else None
+        take_profit = [float(v) for v in ENTRY_TP_RE.findall(text)]
 
         base, quote = symbol_match.group(1).upper(), symbol_match.group(2).upper()
         return EntrySignal(
@@ -82,6 +87,8 @@ class SignalParser:
             entry_type=entry_type,
             entry_low=entry_low,
             entry_high=entry_high,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
             timestamp=timestamp,
         )
 

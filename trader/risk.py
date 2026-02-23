@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from trader.config import AppConfig
 from trader.models import EntrySignal, EntryType, ManageAction, RiskDecision
@@ -11,6 +11,9 @@ class RiskManager:
     def __init__(self, config: AppConfig, symbol_registry: SymbolRegistry | None = None) -> None:
         self.config = config
         self.symbol_registry = symbol_registry
+        self._peak_equity: float | None = None
+        self._consecutive_stoplosses = 0
+        self._stoploss_cooldown_until: datetime | None = None
 
     def evaluate_entry(
         self,
@@ -19,26 +22,31 @@ class RiskManager:
         account_equity: float,
         now: datetime,
         within_cooldown: bool,
+        open_positions_count: int = 0,
+        signal_quality: float = 1.0,
     ) -> RiskDecision:
         symbol = signal.symbol.upper()
         side = signal.side.value
+        warnings: list[str] = []
 
-        if symbol in self.config.filters.symbol_blacklist:
+        if symbol in self._symbol_blacklist():
             return RiskDecision.reject(f"symbol in blacklist: {symbol}")
 
-        if self.config.filters.symbol_policy == "ALLOWLIST":
-            if symbol not in self.config.filters.symbol_whitelist:
+        symbol_policy = self._symbol_policy()
+        if symbol_policy == "ALLOWLIST":
+            allowlist = self._symbol_allowlist()
+            if symbol not in allowlist:
                 return RiskDecision.reject(f"symbol not in whitelist: {symbol}")
-        elif self.config.filters.symbol_policy == "ALLOW_ALL":
+        elif symbol_policy == "ALLOW_ALL":
             if self.config.filters.require_exchange_symbol:
                 if self.symbol_registry is None:
                     return RiskDecision.reject("symbol registry unavailable while require_exchange_symbol=true")
                 if not self.symbol_registry.is_tradable(symbol):
                     return RiskDecision.reject(f"symbol not tradable on Bitget USDT futures: {symbol}")
         else:
-            return RiskDecision.reject(f"unsupported symbol policy: {self.config.filters.symbol_policy}")
+            return RiskDecision.reject(f"unsupported symbol policy: {symbol_policy}")
 
-        min_volume = self.config.filters.min_usdt_volume_24h
+        min_volume = self._min_24h_volume()
         if min_volume is not None:
             if self.symbol_registry is None:
                 return RiskDecision.reject("symbol registry unavailable while min_usdt_volume_24h is enabled")
@@ -52,13 +60,15 @@ class RiskManager:
             return RiskDecision.reject(f"side not allowed: {side}")
 
         leverage = signal.leverage or 1
-        if leverage > self.config.filters.max_leverage:
-            action = self.config.filters.leverage_over_limit_action
-            if action == "REJECT":
+        max_leverage = self._max_leverage()
+        leverage_policy = self._leverage_policy()
+        if leverage > max_leverage:
+            if leverage_policy == "REJECT":
                 return RiskDecision.reject(
-                    f"leverage {leverage} exceeds max_leverage {self.config.filters.max_leverage}"
+                    f"leverage {leverage} exceeds max_leverage {max_leverage}"
                 )
-            leverage = self.config.filters.max_leverage
+            warnings.append(f"leverage capped from {leverage} to {max_leverage}")
+            leverage = max_leverage
 
         signal_time = signal.timestamp
         if signal_time:
@@ -68,40 +78,73 @@ class RiskManager:
             if age_sec > self.config.filters.max_signal_age_seconds:
                 return RiskDecision.reject(f"signal too old: {age_sec:.1f}s")
 
+        if self._stoploss_cooldown_until is not None and now < self._stoploss_cooldown_until:
+            return RiskDecision.reject(
+                f"circuit breaker cooldown active until {self._stoploss_cooldown_until.isoformat()}"
+            )
+
         if within_cooldown:
             return RiskDecision.reject(
                 f"cooldown active for {symbol} {side}, {self.config.risk.cooldown_seconds}s"
             )
 
-        if signal.entry_type == EntryType.LIMIT:
-            if current_price < signal.entry_low:
-                deviation_pct = ((signal.entry_low - current_price) / signal.entry_low) * 100
-            elif current_price > signal.entry_high:
-                deviation_pct = ((current_price - signal.entry_high) / signal.entry_high) * 100
-            else:
-                deviation_pct = 0.0
+        if open_positions_count >= self.config.risk.max_open_positions:
+            return RiskDecision.reject(
+                f"max_open_positions reached: {open_positions_count}/{self.config.risk.max_open_positions}"
+            )
 
-            if deviation_pct > self.config.risk.entry_slippage_pct:
-                return RiskDecision.reject(
-                    f"price deviation {deviation_pct:.3f}% exceeds {self.config.risk.entry_slippage_pct}%"
-                )
+        if signal_quality < self.config.risk.min_signal_quality:
+            return RiskDecision.reject(
+                f"signal quality {signal_quality:.2f} below min_signal_quality {self.config.risk.min_signal_quality:.2f}"
+            )
 
-        stop_loss_pct = max(self.config.risk.default_stop_loss_pct, 0.05) / 100
-        risk_capital = account_equity * self.config.risk.account_risk_per_trade
-        notional_by_risk = risk_capital / stop_loss_pct
-        notional = min(notional_by_risk, self.config.risk.max_notional_per_trade)
-
-        if notional <= 0:
-            return RiskDecision.reject("notional <= 0 after risk sizing")
+        drawdown = self._compute_drawdown(account_equity)
+        if drawdown > self.config.risk.max_account_drawdown_pct:
+            return RiskDecision.reject(
+                f"drawdown {drawdown:.4f} exceeds max_account_drawdown_pct {self.config.risk.max_account_drawdown_pct:.4f}"
+            )
 
         if current_price <= 0:
             return RiskDecision.reject("invalid market price")
 
-        quantity = notional / current_price
+        if signal.entry_type == EntryType.LIMIT:
+            if current_price < signal.entry_low:
+                deviation = (signal.entry_low - current_price) / signal.entry_low
+            elif current_price > signal.entry_high:
+                deviation = (current_price - signal.entry_high) / signal.entry_high
+            else:
+                deviation = 0.0
+
+            max_slippage = self._ratio_from_percent_or_ratio(
+                self.config.risk.entry_slippage_pct
+                if self.config.risk.entry_slippage_pct is not None
+                else self.config.risk.max_entry_slippage_pct
+            )
+            if deviation > max_slippage:
+                return RiskDecision.reject(
+                    f"price deviation {deviation:.4f} exceeds max_entry_slippage_pct {max_slippage:.4f}"
+                )
+
+        entry_price = self._pick_limit_price(signal)
+        if entry_price <= 0:
+            return RiskDecision.reject("entry_price <= 0")
+
+        stop_loss_price, stop_distance = self._resolve_stop_loss(signal, entry_price)
+        if stop_loss_price is None or stop_distance <= 0:
+            return RiskDecision.reject("stop loss unavailable or invalid")
+
+        if self.config.risk.hard_stop_loss_required and stop_loss_price is None:
+            return RiskDecision.reject("hard_stop_loss_required=true but stop loss is unavailable")
+
+        max_loss = account_equity * self.config.risk.account_risk_per_trade
+        quantity = max_loss / (stop_distance * entry_price)
         if quantity <= 0:
             return RiskDecision.reject("quantity <= 0")
 
-        entry_price = self._pick_limit_price(signal)
+        notional = quantity * entry_price
+        if notional > self.config.risk.max_notional_per_trade:
+            notional = self.config.risk.max_notional_per_trade
+            quantity = notional / entry_price
 
         return RiskDecision(
             approved=True,
@@ -112,6 +155,10 @@ class RiskManager:
             notional=notional,
             quantity=quantity,
             entry_price=entry_price,
+            stop_loss_price=stop_loss_price,
+            stop_distance_ratio=stop_distance,
+            quality_score=signal_quality,
+            warnings=warnings,
         )
 
     def evaluate_manage(self, action: ManageAction) -> RiskDecision:
@@ -125,6 +172,91 @@ class RiskManager:
             return RiskDecision.reject("manage action has no executable fields")
 
         return RiskDecision(approved=True, symbol=action.symbol)
+
+    def record_stop_loss(self, now: datetime) -> None:
+        self._consecutive_stoplosses += 1
+        if self._consecutive_stoplosses >= self.config.risk.consecutive_stoploss_limit:
+            self._stoploss_cooldown_until = now + timedelta(seconds=self.config.risk.stoploss_cooldown_seconds)
+
+    def record_non_stoploss_close(self) -> None:
+        self._consecutive_stoplosses = 0
+
+    def _compute_drawdown(self, account_equity: float) -> float:
+        if account_equity <= 0:
+            return 1.0
+        if self._peak_equity is None:
+            self._peak_equity = account_equity
+            return 0.0
+        if account_equity > self._peak_equity:
+            self._peak_equity = account_equity
+            return 0.0
+        return (self._peak_equity - account_equity) / self._peak_equity
+
+    def _resolve_stop_loss(self, signal: EntrySignal, entry_price: float) -> tuple[float | None, float]:
+        if entry_price <= 0:
+            return None, 0.0
+
+        if signal.stop_loss is not None:
+            stop_price = float(signal.stop_loss)
+            if signal.side.value == "LONG":
+                if stop_price >= entry_price:
+                    return None, 0.0
+            else:
+                if stop_price <= entry_price:
+                    return None, 0.0
+            return stop_price, abs(entry_price - stop_price) / entry_price
+
+        default_ratio = self._ratio_from_percent_or_ratio(self.config.risk.default_stop_loss_pct)
+        if default_ratio <= 0:
+            return None, 0.0
+        if signal.side.value == "LONG":
+            stop_price = entry_price * (1 - default_ratio)
+        else:
+            stop_price = entry_price * (1 + default_ratio)
+        return stop_price, default_ratio
+
+    def _symbol_policy(self) -> str:
+        if self.config.risk.symbol_allowlist:
+            return self.config.risk.allow_symbols_policy
+        return self.config.filters.symbol_policy
+
+    def _symbol_allowlist(self) -> set[str]:
+        risk_allowlist = set(self.config.risk.symbol_allowlist)
+        if risk_allowlist:
+            return risk_allowlist
+        return set(self.config.filters.symbol_whitelist)
+
+    def _symbol_blacklist(self) -> set[str]:
+        return set(self.config.filters.symbol_blacklist) | set(self.config.risk.symbol_blacklist)
+
+    def _min_24h_volume(self) -> float | None:
+        if self.config.risk.min_24h_usdt_volume is not None:
+            return self.config.risk.min_24h_usdt_volume
+        return self.config.filters.min_usdt_volume_24h
+
+    def _max_leverage(self) -> int:
+        if self.config.risk.max_leverage > 0:
+            return self.config.risk.max_leverage
+        return self.config.filters.max_leverage
+
+    def _leverage_policy(self) -> str:
+        if self.config.risk.leverage_policy == "REJECT":
+            return "REJECT"
+        if self.config.filters.leverage_over_limit_action == "REJECT":
+            return "REJECT"
+        if self.config.risk.leverage_policy == "CAP":
+            return "CAP"
+        return "REJECT" if self.config.filters.leverage_over_limit_action == "REJECT" else "CAP"
+
+    @staticmethod
+    def _ratio_from_percent_or_ratio(value: float) -> float:
+        if value <= 0:
+            return 0.0
+        if value >= 1:
+            return value / 100.0
+        if value > 0.05:
+            return value / 100.0
+        return value
 
     def _pick_limit_price(self, signal: EntrySignal) -> float:
         strategy = self.config.execution.limit_price_strategy

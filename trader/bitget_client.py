@@ -11,13 +11,22 @@ from urllib.parse import urlencode
 import requests
 
 from trader.config import BitgetConfig
+from trader.rate_limiter import TokenBucketRateLimiter, exponential_backoff_seconds
 
 
 class BitgetClient:
-    def __init__(self, config: BitgetConfig, timeout: int = 10) -> None:
+    def __init__(
+        self,
+        config: BitgetConfig,
+        timeout: int = 10,
+        rate_limiter: TokenBucketRateLimiter | None = None,
+        max_retries: int = 2,
+    ) -> None:
         self.config = config
         self.timeout = timeout
+        self.max_retries = max_retries
         self.session = requests.Session()
+        self.rate_limiter = rate_limiter or TokenBucketRateLimiter(rate_per_sec=8.0, capacity=16.0)
 
     def get_ticker_price(self, symbol: str) -> float:
         data = self._request(
@@ -37,6 +46,23 @@ class BitgetClient:
             if key in payload:
                 return float(payload[key])
         raise RuntimeError(f"Ticker response missing price: {payload}")
+
+    def get_ticker(self, symbol: str) -> dict[str, Any]:
+        data = self._request(
+            "GET",
+            "/api/v2/mix/market/ticker",
+            params={"symbol": symbol, "productType": self.config.product_type},
+            auth=False,
+        )
+        payload = data[0] if isinstance(data, list) and data else (data or {})
+        return {
+            "symbol": symbol,
+            "last_price": self._float(payload, ["lastPr", "last", "price"]),
+            "mark_price": self._float(payload, ["markPrice", "markPr"]),
+            "bid_price": self._float(payload, ["bidPr", "bidPrice"]),
+            "ask_price": self._float(payload, ["askPr", "askPrice"]),
+            "raw": payload,
+        }
 
     def get_contracts(self) -> list[dict[str, Any]]:
         data = self._request(
@@ -88,6 +114,29 @@ class BitgetClient:
                 if key in record:
                     return float(record[key])
         raise RuntimeError(f"Account response missing equity: {data}")
+
+    def get_account_snapshot(self) -> dict[str, float]:
+        data = self._request(
+            "GET",
+            "/api/v2/mix/account/accounts",
+            params={"productType": self.config.product_type},
+            auth=True,
+        )
+        records = data if isinstance(data, list) else [data]
+        target = None
+        for row in records:
+            if str(row.get("marginCoin", "")).upper() == "USDT":
+                target = row
+                break
+        if target is None and records:
+            target = records[0]
+        if target is None:
+            raise RuntimeError("account snapshot unavailable")
+
+        equity = self._float(target, ["usdtEquity", "equity", "accountEquity"]) or 0.0
+        available = self._float(target, ["available", "availableBalance", "usdtAvailable"]) or equity
+        margin_used = self._float(target, ["locked", "margin", "marginUsed"]) or max(equity - available, 0.0)
+        return {"equity": equity, "available": available, "margin_used": margin_used}
 
     def set_leverage(self, symbol: str, leverage: int, hold_side: str | None = None) -> dict[str, Any]:
         body: dict[str, Any] = {
@@ -151,6 +200,21 @@ class BitgetClient:
             auth=True,
         )
 
+    def get_positions(self) -> list[dict[str, Any]]:
+        data = self._request(
+            "GET",
+            "/api/v2/mix/position/all-position",
+            params={"productType": self.config.product_type, "marginCoin": "USDT"},
+            auth=True,
+        )
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            if isinstance(data.get("list"), list):
+                return data.get("list", [])
+            return [data]
+        return []
+
     def get_order(self, symbol: str, order_id: str) -> dict[str, Any]:
         return self._request(
             "GET",
@@ -162,6 +226,79 @@ class BitgetClient:
             },
             auth=True,
         )
+
+    def get_order_state(
+        self,
+        symbol: str,
+        order_id: str | None = None,
+        client_order_id: str | None = None,
+    ) -> dict[str, Any]:
+        params = {
+            "symbol": symbol,
+            "productType": self.config.product_type,
+        }
+        if order_id:
+            params["orderId"] = order_id
+        elif client_order_id:
+            params["clientOid"] = client_order_id
+        else:
+            raise ValueError("order_id or client_order_id required")
+
+        return self._request("GET", "/api/v2/mix/order/detail", params=params, auth=True)
+
+    def get_open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {"productType": self.config.product_type}
+        if symbol:
+            params["symbol"] = symbol
+        data = self._request("GET", "/api/v2/mix/order/orders-pending", params=params, auth=True)
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            if isinstance(data.get("entrustedList"), list):
+                return data["entrustedList"]
+            if isinstance(data.get("list"), list):
+                return data["list"]
+            return [data]
+        return []
+
+    def get_funding_rate(self, symbol: str) -> float | None:
+        data = self._request(
+            "GET",
+            "/api/v2/mix/market/current-fund-rate",
+            params={"symbol": symbol, "productType": self.config.product_type},
+            auth=False,
+        )
+        payload = data[0] if isinstance(data, list) and data else (data or {})
+        return self._float(payload, ["fundingRate", "fundRate", "currentFundRate"])
+
+    def protective_close_position(self, symbol: str, side: str, size: float) -> dict[str, Any]:
+        close_side = "sell" if side.lower() == "long" else "buy"
+        return self.place_order(
+            symbol=symbol,
+            side=close_side,
+            trade_side="close" if self.config.position_mode == "hedge_mode" else None,
+            size=size,
+            order_type="market",
+            reduce_only=self.config.position_mode == "one_way_mode",
+        )
+
+    def get_open_positions_count(self) -> int:
+        data = self._request(
+            "GET",
+            "/api/v2/mix/position/all-position",
+            params={"productType": self.config.product_type, "marginCoin": "USDT"},
+            auth=True,
+        )
+        records = data if isinstance(data, list) else [data]
+        count = 0
+        for row in records:
+            try:
+                size = float(row.get("total", row.get("size", 0)) or 0)
+            except Exception:  # noqa: BLE001
+                size = 0.0
+            if abs(size) > 0:
+                count += 1
+        return count
 
     def _request(
         self,
@@ -195,23 +332,35 @@ class BitgetClient:
                 }
             )
 
-        response = self.session.request(
-            method,
-            url,
-            headers=headers,
-            data=data if data else None,
-            timeout=self.timeout,
-        )
+        last_error: Exception | None = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                self.rate_limiter.acquire(1.0)
+                response = self.session.request(
+                    method,
+                    url,
+                    headers=headers,
+                    data=data if data else None,
+                    timeout=self.timeout,
+                )
 
-        if response.status_code >= 400:
-            raise RuntimeError(f"Bitget HTTP {response.status_code}: {response.text}")
+                if response.status_code == 429:
+                    raise RuntimeError(f"Bitget rate limited 429: {response.text}")
+                if response.status_code >= 400:
+                    raise RuntimeError(f"Bitget HTTP {response.status_code}: {response.text}")
 
-        payload = response.json()
-        code = str(payload.get("code", ""))
-        if code not in {"00000", "0", "success", ""}:
-            raise RuntimeError(f"Bitget API error {code}: {payload.get('msg')} | payload={payload}")
+                payload = response.json()
+                code = str(payload.get("code", ""))
+                if code not in {"00000", "0", "success", ""}:
+                    raise RuntimeError(f"Bitget API error {code}: {payload.get('msg')} | payload={payload}")
 
-        return payload.get("data")
+                return payload.get("data")
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                if attempt >= self.max_retries:
+                    break
+                time.sleep(exponential_backoff_seconds(attempt))
+        raise RuntimeError(f"Bitget request failed after retries: {last_error}")
 
     def _sign(self, timestamp: str, method: str, path: str, query_string: str, body: str) -> str:
         request_path = path if not query_string else f"{path}?{query_string}"
@@ -222,3 +371,13 @@ class BitgetClient:
             hashlib.sha256,
         ).digest()
         return base64.b64encode(digest).decode("utf-8")
+
+    @staticmethod
+    def _float(payload: dict[str, Any], keys: list[str]) -> float | None:
+        for key in keys:
+            if key in payload and payload[key] not in {None, ""}:
+                try:
+                    return float(payload[key])
+                except Exception:  # noqa: BLE001
+                    continue
+        return None

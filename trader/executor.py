@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import logging
+import time
+import uuid
 from decimal import Decimal, ROUND_DOWN
 
 from trader.bitget_client import BitgetClient
 from trader.config import AppConfig
 from trader.models import EntrySignal, ManageAction, OrderIntent, RiskDecision
 from trader.notifier import Notifier
+from trader.state import OrderState, StateStore, utc_now
 from trader.store import SQLiteStore
 from trader.symbol_registry import SymbolRegistry
 
@@ -20,6 +23,7 @@ class TradeExecutor:
         notifier: Notifier,
         logger: logging.Logger,
         symbol_registry: SymbolRegistry | None = None,
+        runtime_state: StateStore | None = None,
     ) -> None:
         self.config = config
         self.bitget = bitget
@@ -27,6 +31,7 @@ class TradeExecutor:
         self.notifier = notifier
         self.logger = logger
         self.symbol_registry = symbol_registry
+        self.runtime_state = runtime_state
 
     def execute_entry(
         self,
@@ -39,6 +44,38 @@ class TradeExecutor:
         side = "buy" if signal.side.value == "LONG" else "sell"
         trade_side = "open" if self.config.bitget.position_mode == "hedge_mode" else None
         order_type = "market" if signal.entry_type.value == "MARKET" else "limit"
+        client_order_id = f"entry-{uuid.uuid4().hex[:16]}"
+
+        if self.config.risk.hard_stop_loss_required and not self.config.dry_run and not self._supports_exchange_stop_loss():
+            reason = (
+                "hard_stop_loss_required=true but reliable stop-loss order workflow is unavailable; "
+                "set hard_stop_loss_required=false to allow entry-only mode"
+            )
+            intent = {
+                "entry": {
+                    "symbol": signal.symbol,
+                    "side": side,
+                    "trade_side": trade_side,
+                    "order_type": order_type,
+                    "quantity": float(decision.quantity or 0),
+                    "price": None if order_type == "market" else float(decision.entry_price or 0),
+                },
+                "stop_loss": {"required": True, "trigger_price": decision.stop_loss_price},
+                "take_profit": [{"target_price": float(tp)} for tp in signal.take_profit],
+            }
+            self.store.record_execution(
+                chat_id,
+                message_id,
+                version,
+                action_type="ENTRY",
+                symbol=signal.symbol,
+                side=signal.side.value,
+                status="REJECTED",
+                reason=reason,
+                intent=intent,
+            )
+            self.notifier.warning(f"ENTRY rejected: {reason}")
+            return
 
         raw_size = float(decision.quantity)
         raw_price = None if order_type == "market" else float(decision.entry_price)
@@ -56,7 +93,23 @@ class TradeExecutor:
             source_chat_id=chat_id,
             source_message_id=message_id,
             source_version=version,
-            note=f"risk_notional={decision.notional:.4f}",
+            client_order_id=client_order_id,
+            purpose="entry",
+            note=(
+                f"risk_notional={float(decision.notional or 0):.4f};"
+                f"stop_loss={decision.stop_loss_price};"
+                f"warnings={','.join(decision.warnings)}"
+            ),
+        )
+        bundle = self._build_entry_bundle(signal, decision, intent=intent.to_dict())
+
+        self._register_runtime_order(
+            symbol=signal.symbol,
+            side=side,
+            reduce_only=False,
+            trade_side=trade_side,
+            purpose="entry",
+            client_order_id=client_order_id,
         )
 
         if reject_reason:
@@ -69,7 +122,7 @@ class TradeExecutor:
                 side=signal.side.value,
                 status="REJECTED",
                 reason=reject_reason,
-                intent=intent.to_dict(),
+                intent=bundle,
             )
             self.notifier.warning(f"ENTRY rejected: {reject_reason}")
             return
@@ -84,10 +137,11 @@ class TradeExecutor:
                 side=signal.side.value,
                 status="DRY_RUN",
                 reason="dry_run enabled",
-                intent=intent.to_dict(),
+                intent=bundle,
             )
             self.notifier.info(
-                f"DRY_RUN ENTRY {signal.symbol} {signal.side.value} qty={size} price={price} tradeSide={trade_side}"
+                f"DRY_RUN ENTRY {signal.symbol} {signal.side.value} qty={size} "
+                f"price={price} stop_loss={decision.stop_loss_price} tradeSide={trade_side}"
             )
             return
 
@@ -104,7 +158,38 @@ class TradeExecutor:
                 order_type=order_type,
                 price=price,
                 reduce_only=False,
+                client_oid=client_order_id,
             )
+            exchange_order_id: str | None = None
+            if isinstance(receipt, dict):
+                exchange_order_id = str(receipt.get("orderId") or "") or None
+                if self.runtime_state is not None and exchange_order_id:
+                    self.runtime_state.mark_order_status(
+                        status="SUBMITTED",
+                        client_order_id=client_order_id,
+                        order_id=exchange_order_id,
+                    )
+
+            if self.config.execution.require_order_ack:
+                acked, ack_reason = self._wait_order_ack(
+                    symbol=signal.symbol,
+                    order_id=exchange_order_id,
+                    client_order_id=client_order_id,
+                )
+                if not acked:
+                    self.store.record_execution(
+                        chat_id,
+                        message_id,
+                        version,
+                        action_type="ENTRY",
+                        symbol=signal.symbol,
+                        side=signal.side.value,
+                        status="FAILED",
+                        reason=f"order ack timeout: {ack_reason}",
+                        intent=bundle,
+                    )
+                    self.notifier.error(f"ENTRY FAILED {signal.symbol}: order ack timeout")
+                    return
 
             execution_id = self.store.record_execution(
                 chat_id,
@@ -115,12 +200,10 @@ class TradeExecutor:
                 side=signal.side.value,
                 status="EXECUTED",
                 reason=None,
-                intent=intent.to_dict(),
+                intent=bundle,
             )
 
-            order_id = None
-            if isinstance(receipt, dict):
-                order_id = receipt.get("orderId") or receipt.get("clientOid")
+            order_id = exchange_order_id or client_order_id
             self.store.record_order_receipt(execution_id, str(order_id) if order_id else None, receipt)
             self.notifier.info(
                 f"EXECUTED ENTRY {signal.symbol} {signal.side.value} qty={size} order_id={order_id}"
@@ -136,8 +219,13 @@ class TradeExecutor:
                 side=signal.side.value,
                 status="FAILED",
                 reason=str(exc),
-                intent=intent.to_dict(),
+                intent=bundle,
             )
+            if self.runtime_state is not None:
+                self.runtime_state.mark_order_status(
+                    status="FAILED",
+                    client_order_id=client_order_id,
+                )
             self.notifier.error(f"ENTRY FAILED {signal.symbol}: {exc}")
 
     def execute_manage(
@@ -347,6 +435,88 @@ class TradeExecutor:
                 return rounded_qty, rounded_price, f"price <= 0 after pricePlace rounding ({contract.price_place})"
 
         return rounded_qty, rounded_price, None
+
+    def _register_runtime_order(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        reduce_only: bool,
+        trade_side: str | None,
+        purpose: str,
+        client_order_id: str | None,
+    ) -> None:
+        if self.runtime_state is None:
+            return
+        self.runtime_state.upsert_order(
+            OrderState(
+                symbol=symbol,
+                side=side,
+                status="SUBMITTING",
+                filled=0.0,
+                avg_price=None,
+                reduce_only=reduce_only,
+                trade_side=trade_side,
+                purpose=purpose,
+                timestamp=utc_now(),
+                client_order_id=client_order_id,
+                order_id=None,
+            )
+        )
+
+    def _wait_order_ack(self, symbol: str, order_id: str | None, client_order_id: str | None) -> tuple[bool, str]:
+        deadline = time.time() + self.config.execution.ack_timeout_seconds
+        last_error = ""
+        while time.time() < deadline:
+            try:
+                if self.config.dry_run:
+                    return True, "dry_run"
+                payload = self.bitget.get_order_state(symbol, order_id=order_id, client_order_id=client_order_id)
+                if payload:
+                    if self.runtime_state is not None:
+                        self.runtime_state.mark_order_status(
+                            status=str(payload.get("state", payload.get("status", "SUBMITTED"))),
+                            filled=float(payload.get("baseVolume", payload.get("filledQty", 0.0)) or 0.0),
+                            avg_price=(
+                                float(payload.get("priceAvg", payload.get("avgPrice")))
+                                if payload.get("priceAvg", payload.get("avgPrice")) not in {None, ""}
+                                else None
+                            ),
+                            client_order_id=client_order_id,
+                            order_id=order_id,
+                        )
+                    return True, "ok"
+            except Exception as exc:  # noqa: BLE001
+                last_error = str(exc)
+            time.sleep(0.5)
+        return False, last_error or "ack_timeout"
+
+    def _build_entry_bundle(self, signal: EntrySignal, decision: RiskDecision, intent: dict) -> dict:
+        stop_loss = {
+            "symbol": signal.symbol,
+            "trigger_price": decision.stop_loss_price,
+            "order_type": "market",
+            "reduce_only": True,
+            "trade_side": "close" if self.config.bitget.position_mode == "hedge_mode" else None,
+            "required": True,
+        }
+        take_profit = [
+            {
+                "symbol": signal.symbol,
+                "target_price": float(tp),
+                "reduce_only": True,
+            }
+            for tp in signal.take_profit
+        ]
+        return {
+            "entry": intent,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+        }
+
+    @staticmethod
+    def _supports_exchange_stop_loss() -> bool:
+        return False
 
     @staticmethod
     def _round_down(value: float, decimals: int) -> float:

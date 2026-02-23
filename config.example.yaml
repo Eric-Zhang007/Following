@@ -1,8 +1,18 @@
 dry_run: true
 
+listener:
+  mode: "web_preview"           # telegram / web_preview
+  polling_seconds: 5
+  target_url: "https://t.me/s/IvanCryptotalk"
+  user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) FollowingBot/1.0"
+  request_timeout_seconds: 15
+  max_retries: 3
+  backoff_seconds: 1.0
+  web_chat_id: 777001
+
 telegram:
-  api_id: 123456
-  api_hash: "your_telegram_api_hash"
+  api_id: null                   # web_preview 模式下可为空
+  api_hash: null                 # web_preview 模式下可为空
   session_name: "ivan_listener"
   channel: "@IvanCryptotalk"
   notify_chat_id: null
@@ -13,11 +23,10 @@ bitget:
   api_secret: "YOUR_BITGET_API_SECRET"
   passphrase: "YOUR_BITGET_PASSPHRASE"
   product_type: "USDT-FUTURES"
-  margin_mode: "isolated"      # isolated / crossed
-  position_mode: "one_way_mode" # one_way_mode / hedge_mode
-  force: "gtc"                 # gtc / ioc / fok / post_only
+  margin_mode: "isolated"
+  position_mode: "one_way_mode"
+  force: "gtc"
 
-# Option A: ALLOWLIST (recommended conservative start)
 filters:
   symbol_policy: "ALLOWLIST"
   symbol_whitelist: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "CYBERUSDT", "KITEUSDT"]
@@ -27,27 +36,59 @@ filters:
   max_leverage: 10
   allow_sides: ["LONG", "SHORT"]
   max_signal_age_seconds: 20
-  leverage_over_limit_action: "CLAMP"  # CLAMP or REJECT
-
-# Option B: ALLOW_ALL (for more symbols, incl. niche coins)
-# filters:
-#   symbol_policy: "ALLOW_ALL"
-#   symbol_whitelist: []
-#   symbol_blacklist: ["SCAMUSDT", "LOWLIQUSDT"]
-#   require_exchange_symbol: true
-#   min_usdt_volume_24h: 1000000
-#   max_leverage: 10
-#   allow_sides: ["LONG", "SHORT"]
-#   max_signal_age_seconds: 20
-#   leverage_over_limit_action: "CLAMP"
+  leverage_over_limit_action: "CLAMP"
 
 risk:
-  account_risk_per_trade: 0.005
+  max_account_drawdown_pct: 0.15
+  account_risk_per_trade: 0.003
+  max_leverage: 10
+  leverage_policy: "CAP"
+  default_stop_loss_pct: 0.006
+  hard_stop_loss_required: true
+  max_entry_slippage_pct: 0.003
   max_notional_per_trade: 200
-  entry_slippage_pct: 0.3
+  max_open_positions: 3
   cooldown_seconds: 300
-  default_stop_loss_pct: 1.0
+  min_signal_quality: 0.8
+  allow_symbols_policy: "ALLOWLIST"
+  symbol_allowlist: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "CYBERUSDT", "KITEUSDT"]
+  symbol_blacklist: []
+  min_24h_usdt_volume: null
+  max_total_margin_used_pct: 0.35
+  max_liquidation_distance_pct: 0.01
+  stoploss:
+    must_exist: true
+    max_time_without_sl_seconds: 10
+    sl_order_type: "local_guard"   # trigger / plan / local_guard
+    emergency_close_if_sl_place_fails: true
+  circuit_breaker:
+    consecutive_stop_losses: 3
+    cooldown_seconds: 3600
+    api_error_burst: 10
+    api_error_window_seconds: 120
   assumed_equity_usdt: 1000
+
+monitor:
+  enabled: true
+  poll_intervals:
+    account_seconds: 5
+    positions_seconds: 3
+    open_orders_seconds: 3
+    funding_seconds: 60
+    contracts_seconds: 3600
+    reconciler_seconds: 2
+    risk_daemon_seconds: 2
+  price_feed:
+    mode: "rest"                # ws / rest
+    interval_seconds: 2
+  health:
+    host: "127.0.0.1"
+    port: 8080
+    enable_metrics: true
+  alerts:
+    level: "INFO"               # INFO / WARN / ERROR / CRITICAL
+    telegram_enabled: false
+    telegram_chat_id: null
 
 logging:
   level: "INFO"
@@ -56,13 +97,19 @@ logging:
 
 storage:
   db_path: "trader.db"
+  media_dir: "media"
 
 execution:
-  limit_price_strategy: "MID"  # MID/LOW/HIGH
+  limit_price_strategy: "MID"   # MID / LOW / HIGH
+  require_order_ack: true
+  ack_timeout_seconds: 8
+  max_submit_retries: 2
+  prefer_post_only_limit: false
+  close_on_invariant_violation: true
 
 llm:
   enabled: true
-  mode: "hybrid"  # rules_only / hybrid / llm_only
+  mode: "hybrid"               # rules_only / hybrid / llm_only
   provider: "openai"
   model: "YOUR_MODEL_NAME"
   api_key_env: "OPENAI_API_KEY"
@@ -74,3 +121,14 @@ llm:
   redact_patterns:
     - "(?i)api_key\\s*[:=]\\s*\\S+"
     - "(?i)secret\\s*[:=]\\s*\\S+"
+
+vlm:
+  enabled: true
+  provider: "nim"              # nim / kimi
+  model: "YOUR_VLM_MODEL"
+  api_key_env: "NIM_API_KEY"
+  base_url: null
+  timeout_seconds: 20
+  max_retries: 2
+  confidence_threshold: 0.8
+  below_threshold_action: "notify_only"

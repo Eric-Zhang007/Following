@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
@@ -10,6 +10,7 @@ class ParsedKind(str, Enum):
     ENTRY_SIGNAL = "ENTRY_SIGNAL"
     MANAGE_ACTION = "MANAGE_ACTION"
     NON_SIGNAL = "NON_SIGNAL"
+    NEEDS_MANUAL = "NEEDS_MANUAL"
 
 
 class Side(str, Enum):
@@ -33,6 +34,8 @@ class EntrySignal:
     entry_type: EntryType
     entry_low: float
     entry_high: float
+    stop_loss: float | None = None
+    take_profit: list[float] = field(default_factory=list)
     timestamp: datetime | None = None
 
 
@@ -56,7 +59,16 @@ class NonSignal:
     timestamp: datetime | None = None
 
 
-ParsedMessage = EntrySignal | ManageAction | NonSignal
+@dataclass
+class NeedsManual:
+    kind: ParsedKind
+    raw_text: str
+    reason: str
+    missing_fields: list[str] = field(default_factory=list)
+    timestamp: datetime | None = None
+
+
+ParsedMessage = EntrySignal | ManageAction | NonSignal | NeedsManual
 
 
 @dataclass
@@ -69,6 +81,10 @@ class RiskDecision:
     notional: float | None = None
     quantity: float | None = None
     entry_price: float | None = None
+    stop_loss_price: float | None = None
+    stop_distance_ratio: float | None = None
+    quality_score: float | None = None
+    warnings: list[str] = field(default_factory=list)
 
     @classmethod
     def reject(cls, reason: str) -> "RiskDecision":
@@ -88,6 +104,8 @@ class OrderIntent:
     source_chat_id: int
     source_message_id: int
     source_version: int
+    client_order_id: str | None = None
+    purpose: str = "entry"
     note: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -101,6 +119,9 @@ class TelegramEvent:
     text: str
     is_edit: bool
     date: datetime
+    image_url: str | None = None
+    media_sha256: str | None = None
+    source: str = "telegram"
 
 
 def utc_now() -> datetime:

@@ -109,6 +109,80 @@ class SQLiteStore:
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(execution_id) REFERENCES executions(id)
             );
+
+            CREATE TABLE IF NOT EXISTS media_assets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sha256 TEXT NOT NULL UNIQUE,
+                source_url TEXT,
+                local_path TEXT NOT NULL,
+                mime_type TEXT,
+                size_bytes INTEGER,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS message_media (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                version INTEGER NOT NULL,
+                sha256 TEXT NOT NULL,
+                source_url TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(chat_id, message_id, version, sha256),
+                FOREIGN KEY(sha256) REFERENCES media_assets(sha256)
+            );
+
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type TEXT NOT NULL,
+                level TEXT NOT NULL,
+                msg TEXT NOT NULL,
+                payload_json TEXT,
+                trace_id TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS equity_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                equity REAL NOT NULL,
+                available REAL,
+                margin_used REAL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS invariants_violations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                invariant_name TEXT NOT NULL,
+                symbol TEXT,
+                reason TEXT NOT NULL,
+                payload_json TEXT,
+                trace_id TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS reconciler_actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT,
+                order_id TEXT,
+                client_order_id TEXT,
+                action TEXT NOT NULL,
+                reason TEXT,
+                payload_json TEXT,
+                trace_id TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS runtime_state_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                state_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS system_flags (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at TEXT NOT NULL
+            );
             """
         )
 
@@ -354,6 +428,191 @@ class SQLiteStore:
             VALUES(?,?,?,?)
             """,
             (execution_id, exchange_order_id, json.dumps(payload, ensure_ascii=False, default=str), self._now_iso()),
+        )
+        self.conn.commit()
+
+    def record_event(
+        self,
+        event_type: str,
+        level: str,
+        msg: str,
+        payload: dict[str, Any] | None = None,
+        trace_id: str | None = None,
+    ) -> int:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO events(type, level, msg, payload_json, trace_id, created_at)
+            VALUES(?,?,?,?,?,?)
+            """,
+            (
+                event_type,
+                level,
+                msg,
+                json.dumps(payload, ensure_ascii=False, default=str) if payload is not None else None,
+                trace_id,
+                self._now_iso(),
+            ),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def snapshot_equity(self, equity: float, available: float | None, margin_used: float | None) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO equity_snapshots(equity, available, margin_used, created_at)
+            VALUES(?,?,?,?)
+            """,
+            (equity, available, margin_used, self._now_iso()),
+        )
+        self.conn.commit()
+
+    def record_invariant_violation(
+        self,
+        invariant_name: str,
+        symbol: str | None,
+        reason: str,
+        payload: dict[str, Any] | None = None,
+        trace_id: str | None = None,
+    ) -> int:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO invariants_violations(invariant_name, symbol, reason, payload_json, trace_id, created_at)
+            VALUES(?,?,?,?,?,?)
+            """,
+            (
+                invariant_name,
+                symbol,
+                reason,
+                json.dumps(payload, ensure_ascii=False, default=str) if payload is not None else None,
+                trace_id,
+                self._now_iso(),
+            ),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def record_reconciler_action(
+        self,
+        symbol: str | None,
+        order_id: str | None,
+        client_order_id: str | None,
+        action: str,
+        reason: str | None = None,
+        payload: dict[str, Any] | None = None,
+        trace_id: str | None = None,
+    ) -> int:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO reconciler_actions(symbol, order_id, client_order_id, action, reason, payload_json, trace_id, created_at)
+            VALUES(?,?,?,?,?,?,?,?)
+            """,
+            (
+                symbol,
+                order_id,
+                client_order_id,
+                action,
+                reason,
+                json.dumps(payload, ensure_ascii=False, default=str) if payload is not None else None,
+                trace_id,
+                self._now_iso(),
+            ),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def save_runtime_snapshot(self, state_payload: dict[str, Any]) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO runtime_state_snapshots(state_json, created_at)
+            VALUES(?,?)
+            """,
+            (json.dumps(state_payload, ensure_ascii=False, default=str), self._now_iso()),
+        )
+        self.conn.commit()
+
+    def set_system_flag(self, key: str, value: str | None) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO system_flags(key, value, updated_at) VALUES(?,?,?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+            """,
+            (key, value, self._now_iso()),
+        )
+        self.conn.commit()
+
+    def get_system_flag(self, key: str) -> str | None:
+        cur = self.conn.cursor()
+        cur.execute("SELECT value FROM system_flags WHERE key=? LIMIT 1", (key,))
+        row = cur.fetchone()
+        if row is None:
+            return None
+        return str(row["value"]) if row["value"] is not None else None
+
+    def get_recent_equity_max(self) -> float | None:
+        cur = self.conn.cursor()
+        cur.execute("SELECT MAX(equity) AS max_equity FROM equity_snapshots")
+        row = cur.fetchone()
+        if row is None or row["max_equity"] is None:
+            return None
+        return float(row["max_equity"])
+
+    def get_media_by_sha256(self, sha256: str) -> dict[str, Any] | None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT sha256, source_url, local_path, mime_type, size_bytes, created_at
+            FROM media_assets
+            WHERE sha256=?
+            LIMIT 1
+            """,
+            (sha256,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        return {
+            "sha256": row["sha256"],
+            "source_url": row["source_url"],
+            "local_path": row["local_path"],
+            "mime_type": row["mime_type"],
+            "size_bytes": row["size_bytes"],
+            "created_at": row["created_at"],
+        }
+
+    def save_media_asset(
+        self,
+        sha256: str,
+        source_url: str | None,
+        local_path: str,
+        mime_type: str | None,
+        size_bytes: int,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT OR IGNORE INTO media_assets(sha256, source_url, local_path, mime_type, size_bytes, created_at)
+            VALUES(?,?,?,?,?,?)
+            """,
+            (sha256, source_url, local_path, mime_type, size_bytes, self._now_iso()),
+        )
+        self.conn.commit()
+
+    def link_message_media(
+        self,
+        chat_id: int,
+        message_id: int,
+        version: int,
+        sha256: str,
+        source_url: str | None,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT OR IGNORE INTO message_media(chat_id, message_id, version, sha256, source_url, created_at)
+            VALUES(?,?,?,?,?,?)
+            """,
+            (chat_id, message_id, version, sha256, source_url, self._now_iso()),
         )
         self.conn.commit()
 

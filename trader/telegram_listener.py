@@ -16,6 +16,8 @@ class TelegramListener:
         self.logger = logger
 
     async def run(self, on_event: Callable[[TelegramEvent], Awaitable[None]]) -> None:
+        if self.config.api_id is None or self.config.api_hash is None:
+            raise RuntimeError("telegram api_id/api_hash are required for TelegramListener")
         client = TelegramClient(self.config.session_name, self.config.api_id, self.config.api_hash)
         await client.start()
         self.logger.info("Telethon login successful. Listening channel=%s", self.config.channel)
