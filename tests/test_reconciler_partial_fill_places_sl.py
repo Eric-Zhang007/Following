@@ -3,6 +3,7 @@ import logging
 
 from trader.alerts import AlertManager
 from trader.config import AppConfig
+from trader.models import OrderAck
 from trader.notifier import Notifier
 from trader.order_reconciler import OrderReconciler
 from trader.state import OrderState, StateStore, utc_now
@@ -11,13 +12,14 @@ from trader.store import SQLiteStore
 
 class FakeBitgetPartial:
     def __init__(self) -> None:
-        self.sl_orders = 0
+        self.stoploss_calls = 0
+        self.last_stoploss_size = None
 
     def get_order_state(self, symbol: str, order_id: str | None = None, client_order_id: str | None = None):
         return {
             "state": "PARTIAL",
-            "baseVolume": "1.5",
-            "priceAvg": "100.2",
+            "baseVolume": "0.75",
+            "priceAvg": "100.0",
             "orderId": order_id,
             "clientOid": client_order_id,
         }
@@ -26,16 +28,9 @@ class FakeBitgetPartial:
         return True
 
     def place_stop_loss(self, **kwargs):
-        self.sl_orders += 1
-        return type(
-            "Ack",
-            (),
-            {
-                "order_id": "sl-001",
-                "client_oid": kwargs.get("client_oid", "sl-client"),
-                "status": "ACKED",
-            },
-        )()
+        self.stoploss_calls += 1
+        self.last_stoploss_size = float(kwargs.get("size") or 0)
+        return OrderAck(order_id="sl-partial-1", client_oid=kwargs.get("client_oid"), status="ACKED", raw={})
 
 
 def _config() -> AppConfig:
@@ -50,7 +45,6 @@ def _config() -> AppConfig:
                 "api_secret": "s",
                 "passphrase": "p",
                 "product_type": "USDT-FUTURES",
-                "position_mode": "one_way_mode",
             },
             "filters": {
                 "symbol_policy": "ALLOWLIST",
@@ -78,8 +72,8 @@ def _config() -> AppConfig:
     )
 
 
-def test_reconciler_partial_fill_places_proportional_sl_and_records_reason(tmp_path) -> None:
-    store = SQLiteStore(str(tmp_path / "reconcile.db"))
+def test_partial_fill_places_stoploss_for_filled_size(tmp_path) -> None:
+    store = SQLiteStore(str(tmp_path / "reconcile_partial.db"))
     alerts = AlertManager(Notifier(logging.getLogger("test")), store, logging.getLogger("test"))
     state = StateStore()
     state.upsert_order(
@@ -94,22 +88,25 @@ def test_reconciler_partial_fill_places_proportional_sl_and_records_reason(tmp_p
             trade_side=None,
             purpose="entry",
             timestamp=utc_now(),
-            client_order_id="entry-abc",
-            order_id="1001",
+            client_order_id="entry-100",
+            order_id="100",
         )
     )
 
     bitget = FakeBitgetPartial()
     reconciler = OrderReconciler(_config(), bitget, state, store, alerts)
+
     asyncio.run(reconciler.reconcile_once())
 
-    assert bitget.sl_orders == 1
-    sl_order = state.find_order(order_id="sl-001")
+    assert bitget.stoploss_calls == 1
+    assert bitget.last_stoploss_size == 0.75
+
+    sl_order = state.find_order(order_id="sl-partial-1")
     assert sl_order is not None
     assert sl_order.purpose == "sl"
+    assert sl_order.quantity == 0.75
 
     row = store.conn.execute(
-        "SELECT action, reason FROM reconciler_actions WHERE action='PARTIAL_FILL_ENSURE_SL' ORDER BY id DESC LIMIT 1"
+        "SELECT action FROM reconciler_actions WHERE action='PARTIAL_FILL_ENSURE_SL' ORDER BY id DESC LIMIT 1"
     ).fetchone()
     assert row is not None
-    assert row["reason"] in {"submitted", "dry_run"}

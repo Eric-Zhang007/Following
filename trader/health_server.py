@@ -90,11 +90,16 @@ class HealthServer:
     def _ready_payload(self) -> dict:
         now = utc_now()
         pi = self.config.monitor.poll_intervals
+        max_stale = self.config.monitor.price_feed.max_stale_seconds
+        sl_covered = self._sl_covered()
         checks = {
             "account": _is_fresh(self.state.last_account_ok_at, pi.account_seconds, now),
             "positions": _is_fresh(self.state.last_positions_ok_at, pi.positions_seconds, now),
             "orders": _is_fresh(self.state.last_orders_ok_at, pi.open_orders_seconds, now),
-            "price": _is_fresh(self.state.last_price_ok_at, self.config.monitor.price_feed.interval_seconds, now),
+            "price": _is_fresh(self.state.last_price_ok_at, max_stale, now),
+            "sl_covered": sl_covered,
+            "ws_mode_or_rest": (self.state.price_feed_mode == "ws" and not self.state.price_feed_degraded)
+            or self.state.price_feed_mode == "rest",
         }
         return {
             "ready": all(checks.values()),
@@ -102,10 +107,20 @@ class HealthServer:
             "safe_mode": self.state.safe_mode,
             "panic_mode": self.state.panic_mode,
             "reason": self.state.block_new_entries_reason,
+            "price_feed_mode": self.state.price_feed_mode,
+            "price_feed_degraded": self.state.price_feed_degraded,
         }
+
+    def _sl_covered(self) -> bool:
+        if not self.state.positions:
+            return True
+        for pos in self.state.positions.values():
+            if not self.state.has_valid_stop_loss(pos.symbol, pos.side):
+                return False
+        return True
 
 
 def _is_fresh(last_ok: datetime | None, interval_seconds: int, now: datetime) -> bool:
     if last_ok is None:
         return False
-    return (now - last_ok).total_seconds() <= interval_seconds * 2
+    return (now - last_ok).total_seconds() <= max(interval_seconds, 1)

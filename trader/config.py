@@ -91,6 +91,8 @@ class RiskConfig(BaseModel):
         must_exist: bool = True
         max_time_without_sl_seconds: int = Field(default=10, ge=1, le=600)
         sl_order_type: Literal["trigger", "plan", "local_guard"] = "local_guard"
+        trigger_price_type: Literal["mark", "last"] = "mark"
+        break_even_buffer_pct: float = Field(default=0.0005, ge=0, le=0.02)
         emergency_close_if_sl_place_fails: bool = True
 
     class CircuitBreakerConfig(BaseModel):
@@ -192,6 +194,9 @@ class MonitorPollIntervalsConfig(BaseModel):
 class MonitorPriceFeedConfig(BaseModel):
     mode: Literal["ws", "rest"] = "rest"
     interval_seconds: int = Field(default=2, ge=1, le=60)
+    ws_reconnect_seconds: int = Field(default=3, ge=1, le=60)
+    max_stale_seconds: int = Field(default=5, ge=1, le=120)
+    rest_fallback_action_when_local_guard: Literal["notify_only", "safe_mode"] = "safe_mode"
 
 
 class MonitorHealthConfig(BaseModel):

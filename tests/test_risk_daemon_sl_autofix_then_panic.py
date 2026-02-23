@@ -23,7 +23,7 @@ class FakeBitgetFailSL:
 
     def protective_close_position(self, symbol: str, side: str, size: float):
         self.close_calls += 1
-        return {"ok": True, "symbol": symbol, "size": size}
+        return {"ok": True}
 
 
 def _config() -> AppConfig:
@@ -38,7 +38,6 @@ def _config() -> AppConfig:
                 "api_secret": "s",
                 "passphrase": "p",
                 "product_type": "USDT-FUTURES",
-                "position_mode": "one_way_mode",
             },
             "filters": {
                 "symbol_policy": "ALLOWLIST",
@@ -52,6 +51,7 @@ def _config() -> AppConfig:
                 "leverage_over_limit_action": "CLAMP",
             },
             "risk": {
+                "max_account_drawdown_pct": 0.15,
                 "account_risk_per_trade": 0.003,
                 "max_notional_per_trade": 200,
                 "default_stop_loss_pct": 0.006,
@@ -70,8 +70,8 @@ def _config() -> AppConfig:
     )
 
 
-def test_sl_autofix_fail_triggers_protective_close_and_safe_mode(tmp_path) -> None:
-    store = SQLiteStore(str(tmp_path / "daemon.db"))
+def test_sl_autofix_failures_timeout_then_panic_close(tmp_path) -> None:
+    store = SQLiteStore(str(tmp_path / "slpanic.db"))
     alerts = AlertManager(Notifier(logging.getLogger("test")), store, logging.getLogger("test"))
     state = StateStore()
     state.set_account(equity=1000, available=900, margin_used=100)
@@ -88,7 +88,7 @@ def test_sl_autofix_fail_triggers_protective_close_and_safe_mode(tmp_path) -> No
                 leverage=5,
                 margin_mode="isolated",
                 timestamp=utc_now(),
-                opened_at=utc_now() - timedelta(seconds=20),
+                opened_at=utc_now() - timedelta(seconds=30),
             )
         ]
     )
@@ -108,8 +108,13 @@ def test_sl_autofix_fail_triggers_protective_close_and_safe_mode(tmp_path) -> No
     assert bitget.close_calls == 1
     assert state.safe_mode is True
 
-    row = store.conn.execute(
+    event = store.conn.execute(
+        "SELECT type FROM events WHERE type='SL_AUTOFIX_FAILED_THEN_PANIC' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert event is not None
+
+    action = store.conn.execute(
         "SELECT action, reason FROM reconciler_actions WHERE action='PROTECTIVE_CLOSE_EXECUTED' ORDER BY id DESC LIMIT 1"
     ).fetchone()
-    assert row is not None
-    assert row["reason"] == "sl_autofix_failed_then_panic"
+    assert action is not None
+    assert action["reason"] == "sl_autofix_failed_then_panic"

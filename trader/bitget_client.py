@@ -11,6 +11,7 @@ from urllib.parse import urlencode
 import requests
 
 from trader.config import BitgetConfig
+from trader.models import OrderAck
 from trader.rate_limiter import TokenBucketRateLimiter, exponential_backoff_seconds
 
 
@@ -27,6 +28,9 @@ class BitgetClient:
         self.max_retries = max_retries
         self.session = requests.Session()
         self.rate_limiter = rate_limiter or TokenBucketRateLimiter(rate_per_sec=8.0, capacity=16.0)
+
+    def supports_plan_orders(self) -> bool:
+        return True
 
     def get_ticker_price(self, symbol: str) -> float:
         data = self._request(
@@ -184,6 +188,122 @@ class BitgetClient:
 
         return self._request("POST", "/api/v2/mix/order/place-order", body=body, auth=True)
 
+    def place_stop_loss(
+        self,
+        symbol: str,
+        product_type: str | None,
+        margin_mode: str | None,
+        position_mode: str | None,
+        hold_side: str | None,
+        trigger_price: float,
+        order_price: float | None,
+        size: float,
+        side: str,
+        trade_side: str | None,
+        reduce_only: bool,
+        client_oid: str | None,
+        trigger_type: str = "mark",
+    ) -> OrderAck:
+        return self._place_plan_order(
+            symbol=symbol,
+            product_type=product_type,
+            margin_mode=margin_mode,
+            position_mode=position_mode,
+            hold_side=hold_side,
+            trigger_price=trigger_price,
+            execute_price=order_price,
+            size=size,
+            side=side,
+            trade_side=trade_side,
+            reduce_only=reduce_only,
+            client_oid=client_oid,
+            trigger_type=trigger_type,
+            plan_type="loss_plan",
+        )
+
+    def place_take_profit(
+        self,
+        symbol: str,
+        product_type: str | None,
+        margin_mode: str | None,
+        position_mode: str | None,
+        hold_side: str | None,
+        trigger_price: float,
+        order_price: float | None,
+        size: float,
+        side: str,
+        trade_side: str | None,
+        reduce_only: bool,
+        client_oid: str | None,
+        trigger_type: str = "mark",
+    ) -> OrderAck:
+        return self._place_plan_order(
+            symbol=symbol,
+            product_type=product_type,
+            margin_mode=margin_mode,
+            position_mode=position_mode,
+            hold_side=hold_side,
+            trigger_price=trigger_price,
+            execute_price=order_price,
+            size=size,
+            side=side,
+            trade_side=trade_side,
+            reduce_only=reduce_only,
+            client_oid=client_oid,
+            trigger_type=trigger_type,
+            plan_type="profit_plan",
+        )
+
+    def cancel_plan_order(
+        self,
+        *,
+        symbol: str,
+        order_id: str | None = None,
+        client_oid: str | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "symbol": symbol,
+            "productType": self.config.product_type,
+            "marginCoin": "USDT",
+        }
+        if order_id:
+            body["orderId"] = order_id
+        if client_oid:
+            body["clientOid"] = client_oid
+        if not order_id and not client_oid:
+            raise ValueError("order_id or client_oid is required for cancel_plan_order")
+        return self._request("POST", "/api/v2/mix/order/cancel-plan-order", body=body, auth=True)
+
+    def list_plan_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {
+            "productType": self.config.product_type,
+        }
+        if symbol:
+            params["symbol"] = symbol
+        data = self._request("GET", "/api/v2/mix/order/orders-plan-pending", params=params, auth=True)
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            if isinstance(data.get("entrustedList"), list):
+                return data["entrustedList"]
+            if isinstance(data.get("list"), list):
+                return data["list"]
+            return [data]
+        return []
+
+    def get_order_detail(self, order_id: str) -> dict[str, Any]:
+        data = self._request(
+            "GET",
+            "/api/v2/mix/order/detail",
+            params={"productType": self.config.product_type, "orderId": order_id},
+            auth=True,
+        )
+        if isinstance(data, dict):
+            return data
+        if isinstance(data, list) and data:
+            return data[0]
+        return {}
+
     def cancel_order(self, symbol: str, order_id: str) -> dict[str, Any]:
         body = {
             "symbol": symbol,
@@ -232,7 +352,10 @@ class BitgetClient:
         symbol: str,
         order_id: str | None = None,
         client_order_id: str | None = None,
+        is_plan_order: bool = False,
     ) -> dict[str, Any]:
+        if is_plan_order:
+            return self.get_plan_order_state(symbol=symbol, order_id=order_id, client_order_id=client_order_id)
         params = {
             "symbol": symbol,
             "productType": self.config.product_type,
@@ -245,6 +368,25 @@ class BitgetClient:
             raise ValueError("order_id or client_order_id required")
 
         return self._request("GET", "/api/v2/mix/order/detail", params=params, auth=True)
+
+    def get_plan_order_state(
+        self,
+        *,
+        symbol: str,
+        order_id: str | None = None,
+        client_order_id: str | None = None,
+    ) -> dict[str, Any]:
+        orders = self.list_plan_orders(symbol=symbol)
+        for item in orders:
+            if order_id and str(item.get("orderId") or "") == str(order_id):
+                return item
+            if client_order_id and str(item.get("clientOid") or "") == str(client_order_id):
+                return item
+        if order_id:
+            return {"orderId": order_id, "state": "FILLED_OR_CLOSED"}
+        if client_order_id:
+            return {"clientOid": client_order_id, "state": "FILLED_OR_CLOSED"}
+        raise ValueError("order_id or client_order_id required")
 
     def get_open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
         params: dict[str, Any] = {"productType": self.config.product_type}
@@ -371,6 +513,67 @@ class BitgetClient:
             hashlib.sha256,
         ).digest()
         return base64.b64encode(digest).decode("utf-8")
+
+    def _place_plan_order(
+        self,
+        *,
+        symbol: str,
+        product_type: str | None,
+        margin_mode: str | None,
+        position_mode: str | None,
+        hold_side: str | None,
+        trigger_price: float,
+        execute_price: float | None,
+        size: float,
+        side: str,
+        trade_side: str | None,
+        reduce_only: bool,
+        client_oid: str | None,
+        trigger_type: str,
+        plan_type: str,
+    ) -> OrderAck:
+        ptype = product_type or self.config.product_type
+        pmode = position_mode or self.config.position_mode
+        mmode = margin_mode or self.config.margin_mode
+        body: dict[str, Any] = {
+            "symbol": symbol,
+            "productType": ptype,
+            "marginCoin": "USDT",
+            "marginMode": mmode,
+            "size": f"{size:.6f}",
+            "planType": plan_type,
+            "triggerPrice": f"{trigger_price:.8f}",
+            "triggerType": "mark_price" if trigger_type.lower() == "mark" else "fill_price",
+            "side": side,
+        }
+        if execute_price is not None:
+            body["executePrice"] = f"{execute_price:.8f}"
+        else:
+            body["executePrice"] = "0"
+        if client_oid:
+            body["clientOid"] = client_oid
+
+        if pmode == "one_way_mode":
+            body["reduceOnly"] = "YES" if reduce_only else "NO"
+        else:
+            body["tradeSide"] = trade_side or "close"
+            if hold_side:
+                body["holdSide"] = hold_side
+
+        raw = self._request("POST", "/api/v2/mix/order/place-plan-order", body=body, auth=True)
+        return self._to_ack(raw)
+
+    @staticmethod
+    def _to_ack(payload: dict[str, Any] | list[dict[str, Any]] | None) -> OrderAck:
+        raw: dict[str, Any]
+        if isinstance(payload, list):
+            raw = payload[0] if payload else {}
+        else:
+            raw = payload or {}
+        order_id = str(raw.get("orderId") or "") or None
+        client_oid = str(raw.get("clientOid") or "") or None
+        status = str(raw.get("state") or raw.get("status") or "ACKED")
+        return OrderAck(order_id=order_id, client_oid=client_oid, status=status, raw=raw)
 
     @staticmethod
     def _float(payload: dict[str, Any], keys: list[str]) -> float | None:

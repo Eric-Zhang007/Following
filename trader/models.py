@@ -113,6 +113,14 @@ class OrderIntent:
 
 
 @dataclass
+class OrderAck:
+    order_id: str | None
+    client_oid: str | None
+    status: str
+    raw: dict[str, Any]
+
+
+@dataclass
 class TelegramEvent:
     chat_id: int
     message_id: int

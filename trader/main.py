@@ -5,7 +5,7 @@ import contextlib
 import logging
 import signal
 from dataclasses import asdict, is_dataclass
-from datetime import timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +20,7 @@ from trader.health_server import HealthServer
 from trader.kill_switch import KillSwitch
 from trader.llm_parser import HybridSignalParser, ParseOutcome
 from trader.media import MediaManager
-from trader.models import EntrySignal, ManageAction, NeedsManual, NonSignal, ParsedMessage, TelegramEvent, utc_now
+from trader.models import EntrySignal, ManageAction, NeedsManual, NonSignal, ParsedKind, ParsedMessage, TelegramEvent, utc_now
 from trader.notifier import Notifier
 from trader.order_reconciler import OrderReconciler
 from trader.price_feed import PriceFeed
@@ -28,6 +28,7 @@ from trader.risk import RiskManager
 from trader.risk_daemon import RiskDaemon
 from trader.signal_validator import validate_parsed_message
 from trader.state import StateStore
+from trader.stoploss_manager import StopLossManager
 from trader.store import SQLiteStore
 from trader.symbol_registry import SymbolRegistry
 from trader.telegram_listener import TelegramListener
@@ -92,6 +93,13 @@ async def _run_async(config_path: Path) -> None:
         logger.warning("Initial SymbolRegistry refresh failed: %s", exc)
 
     risk_manager = RiskManager(config, symbol_registry=symbol_registry)
+    stoploss_manager = StopLossManager(
+        config=config,
+        bitget=bitget,
+        state=runtime_state,
+        store=store,
+        alerts=alerts,
+    )
     executor = TradeExecutor(
         config,
         bitget,
@@ -100,6 +108,7 @@ async def _run_async(config_path: Path) -> None:
         logger,
         symbol_registry=symbol_registry,
         runtime_state=runtime_state,
+        stoploss_manager=stoploss_manager,
     )
 
     stop_event = asyncio.Event()
@@ -111,7 +120,14 @@ async def _run_async(config_path: Path) -> None:
     if config.monitor.enabled:
         poller = AccountPoller(config=config, bitget=bitget, state=runtime_state, store=store, alerts=alerts)
         price_feed = PriceFeed(config=config, bitget=bitget, state=runtime_state, alerts=alerts)
-        reconciler = OrderReconciler(config=config, bitget=bitget, state=runtime_state, store=store, alerts=alerts)
+        reconciler = OrderReconciler(
+            config=config,
+            bitget=bitget,
+            state=runtime_state,
+            store=store,
+            alerts=alerts,
+            stoploss_manager=stoploss_manager,
+        )
         kill_switch = KillSwitch(store=store)
         risk_daemon = RiskDaemon(
             config=config,
@@ -120,6 +136,7 @@ async def _run_async(config_path: Path) -> None:
             store=store,
             alerts=alerts,
             kill_switch=kill_switch,
+            stoploss_manager=stoploss_manager,
         )
         health_server = HealthServer(config=config, state=runtime_state)
 
@@ -186,6 +203,13 @@ async def _run_async(config_path: Path) -> None:
                 force_vlm=force_vlm,
             )
             parsed = parse_outcome.parsed
+
+            parsed = _enforce_vlm_evidence_gate(
+                parsed=parsed,
+                outcome=parse_outcome,
+                timestamp=event.date,
+                has_image=image_bytes is not None,
+            )
 
             store.record_parsed_signal(
                 event.chat_id,
@@ -531,6 +555,78 @@ def _signal_quality(outcome: ParseOutcome) -> float:
     if outcome.parse_source == "RULES":
         return 1.0
     return float(outcome.confidence)
+
+
+def _enforce_vlm_evidence_gate(
+    *,
+    parsed: ParsedMessage,
+    outcome: ParseOutcome,
+    timestamp: datetime | None,
+    has_image: bool,
+) -> ParsedMessage:
+    if isinstance(parsed, NeedsManual) or isinstance(parsed, NonSignal):
+        return parsed
+
+    if has_image and not outcome.parse_source.startswith("VLM"):
+        return NeedsManual(
+            kind=ParsedKind.NEEDS_MANUAL,
+            raw_text=getattr(parsed, "raw_text", ""),
+            reason="image_post_requires_vlm_manual_on_fallback",
+            missing_fields=["vlm_output"],
+            timestamp=timestamp,
+        )
+
+    if not outcome.parse_source.startswith("VLM"):
+        return parsed
+
+    payload = outcome.llm_payload or {}
+    evidence = payload.get("evidence", {}) if isinstance(payload, dict) else {}
+    field_evidence = evidence.get("field_evidence", {}) if isinstance(evidence, dict) else {}
+    if not isinstance(field_evidence, dict):
+        field_evidence = {}
+
+    required_fields: list[str] = []
+    if isinstance(parsed, EntrySignal):
+        required_fields.extend(["symbol", "side", "entry.low", "entry.high"])
+        if parsed.stop_loss is not None:
+            required_fields.append("entry.stop_loss")
+        if parsed.take_profit:
+            required_fields.append("entry.tp")
+    elif isinstance(parsed, ManageAction):
+        if parsed.symbol:
+            required_fields.append("symbol")
+        if parsed.reduce_pct is not None:
+            required_fields.append("manage.reduce_pct")
+        if parsed.move_sl_to_be:
+            required_fields.append("manage.move_sl_to_be")
+        if parsed.tp_price is not None:
+            required_fields.append("manage.tp")
+
+    missing: list[str] = []
+    for fp in required_fields:
+        if not _has_field_evidence(field_evidence, fp):
+            missing.append(fp)
+
+    if missing:
+        return NeedsManual(
+            kind=ParsedKind.NEEDS_MANUAL,
+            raw_text=getattr(parsed, "raw_text", ""),
+            reason="missing_evidence_for_order_fields",
+            missing_fields=missing,
+            timestamp=timestamp,
+        )
+    return parsed
+
+
+def _has_field_evidence(field_evidence: dict[str, list[str]], field_path: str) -> bool:
+    if field_path in field_evidence and field_evidence.get(field_path):
+        return True
+    if field_path in {"entry.tp", "manage.tp"}:
+        return any(str(key).startswith(field_path) and field_evidence.get(str(key)) for key in field_evidence.keys())
+    if field_path == "entry.stop_loss":
+        aliases = ("entry.stop_loss", "entry.sl", "stop_loss")
+        return any(field_evidence.get(alias) for alias in aliases)
+    return False
 
 
 async def _symbol_registry_refresh_loop(

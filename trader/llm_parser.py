@@ -233,6 +233,21 @@ class HybridSignalParser:
                     image_bytes=image_bytes,
                 )
             except VLMParseError as exc:
+                if image_bytes is not None or force_vlm:
+                    self.logger.warning("VLM parse failed for image/forced VLM mode, return NEEDS_MANUAL: %s", exc)
+                    return ParseOutcome(
+                        parsed=NeedsManual(
+                            kind=ParsedKind.NEEDS_MANUAL,
+                            raw_text=text,
+                            reason="vlm_parse_failed_image_requires_manual",
+                            missing_fields=["vlm_output"],
+                            timestamp=timestamp,
+                        ),
+                        parse_source="VLM_ERROR_NEEDS_MANUAL",
+                        confidence=0.0,
+                        notes="image_parse_failed_no_rules_fallback",
+                        llm_error=str(exc),
+                    )
                 self.logger.warning("VLM parse failed in hybrid mode, fallback to rules: %s", exc)
                 return ParseOutcome(
                     parsed=rules_outcome.parsed,

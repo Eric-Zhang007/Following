@@ -89,7 +89,7 @@ monitor:
     positions_seconds: 3
     open_orders_seconds: 3
   price_feed:
-    mode: "rest"         # ws / rest
+    mode: "ws"           # ws / rest（ws优先，失败自动降级rest）
     interval_seconds: 2
   health:
     host: "127.0.0.1"
@@ -101,24 +101,33 @@ monitor:
 - 检查不变量（仓位必须有保护、重复开仓防护、异常持仓告警）
 - 风险触发时自动进入 `safe_mode`（禁止新开仓）
 
-## 执行层止损说明
+## 执行层止损说明（生产）
 `ENTRY_SIGNAL` 会生成成套订单意图（Entry + Stop-loss + 可选 TP）。
 
-当前版本默认未启用“可靠的交易所止损下单工作流”，因此当：
-- `dry_run: false`
-- 且 `risk.hard_stop_loss_required: true`
+当前支持两种止损模式：
+- `risk.stoploss.sl_order_type: trigger`（推荐）：使用 Bitget 原生计划委托止损（plan/trigger）。
+- `risk.stoploss.sl_order_type: local_guard`：本地守护止损兜底（依赖 `price_feed`）。
 
-系统会拒绝新开仓（仅通知），避免“无硬止损裸仓”。
+关键语义：
+- ENTRY 成交后立刻补挂 SL；部分成交按已成交数量挂对应 SL。
+- 风控守护发现缺 SL 时先补挂，超时失败才触发保护性平仓 + 熔断。
+- `move_sl_to_be` 会撤旧 SL 并重挂到保本位（含 `break_even_buffer_pct` 缓冲）。
+- 支持分批 TP（reduce-only / tradeSide=close）并纳入对账。
+
+one-way / hedge 差异：
+- `one_way_mode`：平仓/止损使用 `reduceOnly=YES`。
+- `hedge_mode`：平仓/止损使用 `tradeSide=close`，并按 `holdSide` 映射 long/short。
 
 ## 生产运行建议
-1. 使用 `isolated` + `max_leverage` 上限，避免单仓位拖垮账户。
-2. 默认保持 `dry_run: true` 先观察；dry-run 允许运行监控/对账/守护逻辑，但不会真实下单与撤单。
+1. 推荐 `isolated` + `risk.max_leverage` 硬上限，避免高杠杆信号直接照抄执行。
+2. 上线顺序：`dry_run=true` 观察 -> 小额实盘 -> 再逐步扩大规模。
 3. 配置 kill switch：
    - 文件触发：创建 `./KILL_SWITCH`（内容为空或 `safe` 进入 `SAFE_MODE`，`panic` 进入 `PANIC_CLOSE`）
    - 环境变量：`TRADER_KILL_SWITCH=1`（SAFE_MODE）或 `TRADER_KILL_SWITCH=panic`（PANIC_CLOSE）
 4. 明确安全模式语义：
    - `safe_mode`：禁止新开仓，只允许风控修复、止损、减仓和平仓。
    - `panic_close`：一次性触发保护性平仓流程，并保持禁止开仓。
+5. `ws` 行情建议保持开启；若降级到 `rest` 且使用 `local_guard`，系统会执行额外安全降级动作（可配置）。
 
 ## 测试
 ```bash
@@ -135,7 +144,12 @@ pytest
 - `tests/test_circuit_breaker.py`
 - `tests/test_account_poller.py`
 - `tests/test_risk_daemon_stoploss_autofix.py`
+- `tests/test_risk_daemon_sl_autofix_then_panic.py`
 - `tests/test_reconciler_partial_fill.py`
+- `tests/test_reconciler_partial_fill_places_sl.py`
+- `tests/test_stoploss_trigger_orders.py`
+- `tests/test_move_sl_to_be.py`
+- `tests/test_ws_price_feed_fallback.py`
 - `tests/test_kill_switch.py`
 - `tests/test_circuit_breaker_drawdown.py`
 - `tests/test_rate_limiter_backoff.py`

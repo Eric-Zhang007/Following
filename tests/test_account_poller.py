@@ -41,6 +41,9 @@ class FakeBitget:
             }
         ]
 
+    def list_plan_orders(self):
+        return []
+
     def get_funding_rate(self, symbol: str):
         return 0.0001
 

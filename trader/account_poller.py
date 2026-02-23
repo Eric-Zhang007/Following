@@ -120,6 +120,13 @@ class AccountPoller:
 
     async def poll_open_orders(self) -> None:
         raw_orders = await asyncio.to_thread(self.bitget.get_open_orders)
+        plan_orders: list[dict] = []
+        if hasattr(self.bitget, "list_plan_orders"):
+            try:
+                plan_orders = await asyncio.to_thread(self.bitget.list_plan_orders)
+            except Exception:  # noqa: BLE001
+                self.state.register_api_error()
+        raw_orders = list(raw_orders) + list(plan_orders)
         now = utc_now()
         for row in raw_orders:
             symbol = str(row.get("symbol") or "").upper()
@@ -132,6 +139,7 @@ class AccountPoller:
                 side=side,
                 status=str(row.get("state", row.get("status", "NEW"))),
                 filled=float(row.get("baseVolume", row.get("filledQty", 0.0)) or 0.0),
+                quantity=self._to_float(row, ["size", "qty", "baseVolume"]),
                 avg_price=self._to_float(row, ["priceAvg", "avgPrice"]),
                 reduce_only=str(row.get("reduceOnly", "NO")).upper() == "YES",
                 trade_side=str(row.get("tradeSide") or "").lower() or None,
@@ -139,6 +147,8 @@ class AccountPoller:
                 timestamp=now,
                 client_order_id=str(row.get("clientOid") or "") or None,
                 order_id=str(row.get("orderId") or "") or None,
+                trigger_price=self._to_float(row, ["triggerPrice", "triggerPx"]),
+                is_plan_order=bool(row.get("planType") or row.get("triggerType")),
             )
             self.state.upsert_order(state)
 
@@ -156,6 +166,11 @@ class AccountPoller:
 
     @staticmethod
     def _infer_purpose(row: dict) -> str:
+        plan_type = str(row.get("planType") or "").lower()
+        if "profit" in plan_type:
+            return "tp"
+        if "loss" in plan_type:
+            return "sl"
         trade_side = str(row.get("tradeSide") or "").lower()
         reduce_only = str(row.get("reduceOnly", "NO")).upper() == "YES"
         if reduce_only or trade_side == "close":

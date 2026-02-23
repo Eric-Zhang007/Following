@@ -59,7 +59,9 @@ risk:
   stoploss:
     must_exist: true
     max_time_without_sl_seconds: 10
-    sl_order_type: "local_guard"   # trigger / plan / local_guard
+    sl_order_type: "trigger"       # trigger / plan / local_guard
+    trigger_price_type: "mark"     # mark / last
+    break_even_buffer_pct: 0.0005
     emergency_close_if_sl_place_fails: true
   circuit_breaker:
     consecutive_stop_losses: 3
@@ -79,8 +81,11 @@ monitor:
     reconciler_seconds: 2
     risk_daemon_seconds: 2
   price_feed:
-    mode: "rest"                # ws / rest
+    mode: "ws"                  # ws / rest
     interval_seconds: 2
+    ws_reconnect_seconds: 3
+    max_stale_seconds: 5
+    rest_fallback_action_when_local_guard: "safe_mode"  # notify_only / safe_mode
   health:
     host: "127.0.0.1"
     port: 8080
