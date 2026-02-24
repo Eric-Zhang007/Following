@@ -93,6 +93,10 @@ class StateStore:
         self.last_positions_ok_at: datetime | None = None
         self.last_orders_ok_at: datetime | None = None
         self.last_price_ok_at: datetime | None = None
+        self.last_ws_message_at: datetime | None = None
+        self.last_ws_snapshot_at_by_symbol: dict[str, datetime] = {}
+        self.ws_messages_total: int = 0
+        self.ws_parse_errors_total: int = 0
         self.last_reconciler_ok_at: datetime | None = None
         self.peak_equity: float | None = None
         self.api_error_timestamps: list[datetime] = []
@@ -102,6 +106,8 @@ class StateStore:
             "circuit_breaker_state": 0.0,
             "open_positions": 0.0,
             "account_equity": 0.0,
+            "ws_parse_errors": 0.0,
+            "ws_messages": 0.0,
             "ws_fresh": 0.0,
             "sl_coverage_ratio": 1.0,
         }
@@ -280,6 +286,24 @@ class StateStore:
         with self._lock:
             self.last_price_ok_at = timestamp or utc_now()
 
+    def register_ws_message(self, timestamp: datetime | None = None) -> None:
+        with self._lock:
+            now = timestamp or utc_now()
+            self.last_ws_message_at = now
+            self.ws_messages_total += 1
+            self.metrics["ws_messages"] = float(self.ws_messages_total)
+
+    def register_ws_parse_error(self, reason: str, timestamp: datetime | None = None) -> None:
+        with self._lock:
+            _ = reason
+            _ = timestamp or utc_now()
+            self.ws_parse_errors_total += 1
+            self.metrics["ws_parse_errors"] = float(self.ws_parse_errors_total)
+
+    def set_symbol_price_fresh(self, symbol: str, timestamp: datetime | None = None) -> None:
+        with self._lock:
+            self.last_ws_snapshot_at_by_symbol[symbol.upper()] = timestamp or utc_now()
+
     def set_mark_price(self, symbol: str, mark_price: float, timestamp: datetime | None = None) -> None:
         with self._lock:
             key = symbol.upper()
@@ -378,6 +402,11 @@ class StateStore:
                 "orders": {k: asdict(v) for k, v in self.orders_by_client_id.items()},
                 "local_guards": {k: asdict(v) for k, v in self.local_guard_stops.items()},
                 "prices": {k: asdict(v) for k, v in self.prices.items()},
+                "last_ws_snapshot_at_by_symbol": {
+                    k: v.isoformat() for k, v in self.last_ws_snapshot_at_by_symbol.items()
+                },
+                "ws_messages_total": self.ws_messages_total,
+                "ws_parse_errors_total": self.ws_parse_errors_total,
                 "price_feed_mode": self.price_feed_mode,
                 "price_feed_degraded": self.price_feed_degraded,
                 "safe_mode": self.safe_mode,
@@ -388,6 +417,7 @@ class StateStore:
                 "last_positions_ok_at": self.last_positions_ok_at.isoformat() if self.last_positions_ok_at else None,
                 "last_orders_ok_at": self.last_orders_ok_at.isoformat() if self.last_orders_ok_at else None,
                 "last_price_ok_at": self.last_price_ok_at.isoformat() if self.last_price_ok_at else None,
+                "last_ws_message_at": self.last_ws_message_at.isoformat() if self.last_ws_message_at else None,
                 "last_reconciler_ok_at": self.last_reconciler_ok_at.isoformat() if self.last_reconciler_ok_at else None,
             }
 

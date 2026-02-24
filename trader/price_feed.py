@@ -112,30 +112,9 @@ class PriceFeed:
 
                     while not stop_event.is_set():
                         raw = await asyncio.wait_for(ws.recv(), timeout=self.config.monitor.price_feed.max_stale_seconds)
-                        payload = json.loads(raw)
-                        if not isinstance(payload, dict):
-                            continue
-                        data = payload.get("data")
-                        if not isinstance(data, list):
-                            continue
-                        for item in data:
-                            symbol = str(item.get("instId") or item.get("symbol") or "").upper()
-                            if not symbol:
-                                continue
-                            mark = _to_float(item.get("markPrice") or item.get("markPr"))
-                            last = _to_float(item.get("lastPr") or item.get("last"))
-                            bid = _to_float(item.get("bidPr") or item.get("bidPrice"))
-                            ask = _to_float(item.get("askPr") or item.get("askPrice"))
-                            self.state.set_price_snapshot(
-                                symbol=symbol,
-                                mark=mark,
-                                last=last,
-                                bid=bid,
-                                ask=ask,
-                                timestamp=utc_now(),
-                            )
-                        self.state.set_price_fresh()
-                        self.state.metrics["ws_fresh"] = 1.0
+                        valid = self._process_ws_raw(raw)
+                        if valid > 0:
+                            self.state.metrics["ws_fresh"] = 1.0
 
             except Exception as exc:  # noqa: BLE001
                 self.state.register_api_error()
@@ -188,6 +167,77 @@ class PriceFeed:
             payload,
         )
 
+    def _process_ws_raw(self, raw: str | bytes) -> int:
+        self.state.register_ws_message()
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="ignore")
+        try:
+            payload = json.loads(raw)
+        except Exception:  # noqa: BLE001
+            self.state.register_ws_parse_error("invalid_json")
+            return 0
+        if not isinstance(payload, dict):
+            self.state.register_ws_parse_error("payload_not_dict")
+            return 0
+        if self._is_control_message(payload):
+            return 0
+        return self._handle_ws_payload(payload)
+
+    def _handle_ws_payload(self, payload: dict) -> int:
+        data = payload.get("data")
+        if not isinstance(data, list):
+            self.state.register_ws_parse_error("data_not_list")
+            return 0
+
+        valid_snapshots = 0
+        now = utc_now()
+        for item in data:
+            if not isinstance(item, dict):
+                self.state.register_ws_parse_error("item_not_dict")
+                continue
+            symbol = str(item.get("instId") or item.get("symbol") or "").upper()
+            if not symbol:
+                self.state.register_ws_parse_error("symbol_missing")
+                continue
+
+            mark = _resolve_price(item, ["markPrice", "markPr", "mark", "mark_price"])
+            last = _resolve_price(item, ["lastPr", "last", "lastPrice", "price"])
+            bid = _resolve_price(item, ["bidPr", "bidPrice", "bestBid"])
+            ask = _resolve_price(item, ["askPr", "askPrice", "bestAsk"])
+            if mark is None and last is None:
+                self.state.register_ws_parse_error("missing_mark_and_last")
+                continue
+
+            self.state.set_price_snapshot(
+                symbol=symbol,
+                mark=mark,
+                last=last,
+                bid=bid,
+                ask=ask,
+                timestamp=now,
+            )
+            self.state.set_symbol_price_fresh(symbol, timestamp=now)
+            self.state.set_price_fresh(timestamp=now)
+            valid_snapshots += 1
+        return valid_snapshots
+
+    @staticmethod
+    def _is_control_message(payload: dict) -> bool:
+        event = str(payload.get("event") or "").lower()
+        if event in {"subscribe", "unsubscribe", "login", "pong", "ping"}:
+            return True
+        op = str(payload.get("op") or "").lower()
+        if op in {"ping", "pong", "subscribe", "unsubscribe"}:
+            return True
+        action = str(payload.get("action") or "").lower()
+        if action in {"snapshot", "update"}:
+            return False
+        if "arg" in payload and "data" not in payload:
+            return True
+        if "pong" in payload:
+            return True
+        return False
+
 
 def is_price_fresh(last_price_at: datetime | None, max_stale_seconds: int, now: datetime | None = None) -> bool:
     if last_price_at is None:
@@ -203,3 +253,12 @@ def _to_float(value: object) -> float | None:
         return float(value)
     except Exception:  # noqa: BLE001
         return None
+
+
+def _resolve_price(item: dict, keys: list[str]) -> float | None:
+    for key in keys:
+        if key in item:
+            parsed = _to_float(item.get(key))
+            if parsed is not None:
+                return parsed
+    return None

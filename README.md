@@ -96,6 +96,15 @@ monitor:
     port: 8080
 ```
 
+### 5) 计划委托能力探测
+```yaml
+bitget:
+  plan_orders_probe_on_startup: true
+  plan_orders_capability_ttl_seconds: 300
+  plan_orders_probe_timeout_seconds: 6
+  plan_orders_probe_safe_mode_on_failure: true
+```
+
 监控启动后，即使没有新信号也会持续运行：
 - 主动刷新权益、保证金、持仓、挂单
 - 检查不变量（仓位必须有保护、重复开仓防护、异常持仓告警）
@@ -107,6 +116,14 @@ monitor:
 当前支持两种止损模式：
 - `risk.stoploss.sl_order_type: trigger`（推荐）：使用 Bitget 原生计划委托止损（plan/trigger）。
 - `risk.stoploss.sl_order_type: local_guard`：本地守护止损兜底（依赖 `price_feed`）。
+
+Plan/Trigger 能力探测（生产建议开启）：
+- 启动时会按 `bitget.plan_orders_probe_on_startup` 主动探测计划委托能力并缓存。
+- `supports_plan_orders()` 使用 TTL 缓存（`plan_orders_capability_ttl_seconds`），到期自动重探测。
+- 若探测明确不支持且当前为 `trigger/plan`，运行时自动降级为 `local_guard`，并写入事件：
+  - `PLAN_ORDER_CAPABILITY_PROBE`
+  - `PLAN_ORDER_FALLBACK`
+- 网络超时场景会标记为 `unknown`（短 TTL 重试），不会直接永久判定不支持。
 
 关键语义：
 - ENTRY 成交后立刻补挂 SL；部分成交按已成交数量挂对应 SL。
@@ -128,6 +145,9 @@ one-way / hedge 差异：
    - `safe_mode`：禁止新开仓，只允许风控修复、止损、减仓和平仓。
    - `panic_close`：一次性触发保护性平仓流程，并保持禁止开仓。
 5. `ws` 行情建议保持开启；若降级到 `rest` 且使用 `local_guard`，系统会执行额外安全降级动作（可配置）。
+6. 若启用 `monitor.price_feed.ws_required_for_local_guard=true`：
+   - `local_guard` + `rest` 降级会导致 `readyz` 不通过；
+   - 建议配合 `safe_mode` 自动启用，防止在低质量行情源下继续开仓。
 
 ## 测试
 ```bash
@@ -150,6 +170,10 @@ pytest
 - `tests/test_stoploss_trigger_orders.py`
 - `tests/test_move_sl_to_be.py`
 - `tests/test_ws_price_feed_fallback.py`
+- `tests/test_plan_order_capability_probe.py`
+- `tests/test_ws_ticker_parsing.py`
+- `tests/test_readyz_ws_gate.py`
+- `tests/test_tp_size_resolution.py`
 - `tests/test_kill_switch.py`
 - `tests/test_circuit_breaker_drawdown.py`
 - `tests/test_rate_limiter_backoff.py`

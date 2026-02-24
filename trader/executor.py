@@ -474,12 +474,30 @@ class TradeExecutor:
                 self.notifier.error(f"MANAGE move_sl_to_be failed {symbol}: {exc}")
 
         if action.tp_price is not None:
-            self._place_take_profit_orders(
+            tp_result = self._place_take_profit_orders(
                 symbol=symbol,
                 side_hint=None,
                 total_size=None,
                 tp_list=[float(action.tp_price)],
                 parent_client_order_id=None,
+            )
+            status = "EXECUTED" if tp_result["placed"] > 0 else "REJECTED"
+            reason = None if tp_result["placed"] > 0 else tp_result["last_reason"] or "tp_not_placed"
+            self.store.record_execution(
+                chat_id,
+                message_id,
+                version,
+                action_type="MANAGE_TP",
+                symbol=symbol,
+                side=None,
+                status=status,
+                reason=reason,
+                intent={
+                    "symbol": symbol,
+                    "tp_price": float(action.tp_price),
+                    "placed": tp_result["placed"],
+                    "skipped": tp_result["skipped"],
+                },
             )
 
     def _normalize_order_params(
@@ -685,14 +703,64 @@ class TradeExecutor:
         total_size: float | None,
         tp_list: list[float],
         parent_client_order_id: str | None,
-    ) -> None:
+    ) -> dict[str, int | str | None]:
         if not tp_list:
-            return
-        side = "sell" if (side_hint or "LONG").upper() == "LONG" else "buy"
-        size_each = None
-        if total_size is not None and total_size > 0:
-            size_each = total_size / len(tp_list)
-        for tp in tp_list:
+            return {"placed": 0, "skipped": 0, "last_reason": "tp_list_empty"}
+
+        resolved_total_size = total_size if total_size is not None and total_size > 0 else self._resolve_total_tp_size(symbol)
+        if resolved_total_size is None or resolved_total_size <= 0:
+            self._record_tp_event(
+                event_type="TP_SKIPPED_SIZE_UNKNOWN",
+                level="WARN",
+                msg="skip TP placement because position size is unknown",
+                payload={"symbol": symbol, "reason": "size_unknown", "tp_count": len(tp_list)},
+            )
+            self.notifier.warning(f"TP skipped for {symbol}: size unknown")
+            return {"placed": 0, "skipped": len(tp_list), "last_reason": "size_unknown"}
+
+        resolved_side = side_hint or self._resolve_position_side_hint(symbol) or "LONG"
+        side = "sell" if resolved_side.upper() == "LONG" else "buy"
+        trade_side = "close" if self.config.bitget.position_mode == "hedge_mode" else None
+        reduce_only = self.config.bitget.position_mode == "one_way_mode"
+        hold_side = "long" if side == "sell" else "short"
+
+        placed = 0
+        skipped = 0
+        last_reason: str | None = None
+        size_each_raw = resolved_total_size / len(tp_list)
+        for idx, tp in enumerate(tp_list):
+            remaining = resolved_total_size - (size_each_raw * idx)
+            requested_size = min(size_each_raw, max(remaining, 0.0))
+            normalized_size, _, reject_reason = self._normalize_order_params(symbol, requested_size, None)
+            if reject_reason or normalized_size <= 0:
+                skipped += 1
+                last_reason = reject_reason or "tp_size_non_positive_after_normalize"
+                self._record_tp_event(
+                    event_type="TP_SKIPPED_INVALID_SIZE",
+                    level="WARN",
+                    msg="skip TP placement due to invalid normalized size",
+                    payload={
+                        "symbol": symbol,
+                        "reason": last_reason,
+                        "tp_price": float(tp),
+                        "requested_size": requested_size,
+                        "normalized_size": normalized_size,
+                    },
+                )
+                continue
+
+            order_size = float(normalized_size)
+            if order_size <= 0:
+                skipped += 1
+                last_reason = "tp_size_zero_after_normalize"
+                self._record_tp_event(
+                    event_type="TP_SKIPPED_SIZE_ZERO",
+                    level="WARN",
+                    msg="skip TP placement because normalized size is zero",
+                    payload={"symbol": symbol, "reason": last_reason, "tp_price": float(tp)},
+                )
+                continue
+
             try:
                 client_oid = f"tp-{uuid.uuid4().hex[:16]}"
                 if self.config.dry_run:
@@ -703,10 +771,10 @@ class TradeExecutor:
                                 side=side,
                                 status="ACKED",
                                 filled=0.0,
-                                quantity=size_each,
+                                quantity=order_size,
                                 avg_price=None,
-                                reduce_only=self.config.bitget.position_mode == "one_way_mode",
-                                trade_side="close" if self.config.bitget.position_mode == "hedge_mode" else None,
+                                reduce_only=reduce_only,
+                                trade_side=trade_side,
                                 purpose="tp",
                                 timestamp=utc_now(),
                                 client_order_id=client_oid,
@@ -716,19 +784,20 @@ class TradeExecutor:
                                 parent_client_order_id=parent_client_order_id,
                             )
                         )
+                    placed += 1
                     continue
                 ack = self.bitget.place_take_profit(
                     symbol=symbol,
                     product_type=self.config.bitget.product_type,
                     margin_mode=self.config.bitget.margin_mode,
                     position_mode=self.config.bitget.position_mode,
-                    hold_side="long" if side == "sell" else "short",
+                    hold_side=hold_side,
                     trigger_price=float(tp),
                     order_price=None,
-                    size=float(size_each or 0.0),
+                    size=order_size,
                     side=side,
-                    trade_side="close" if self.config.bitget.position_mode == "hedge_mode" else None,
-                    reduce_only=self.config.bitget.position_mode == "one_way_mode",
+                    trade_side=trade_side,
+                    reduce_only=reduce_only,
                     client_oid=client_oid,
                     trigger_type=self.config.risk.stoploss.trigger_price_type,
                 )
@@ -739,10 +808,10 @@ class TradeExecutor:
                             side=side,
                             status=ack.status or "ACKED",
                             filled=0.0,
-                            quantity=size_each,
+                            quantity=order_size,
                             avg_price=None,
-                            reduce_only=self.config.bitget.position_mode == "one_way_mode",
-                            trade_side="close" if self.config.bitget.position_mode == "hedge_mode" else None,
+                            reduce_only=reduce_only,
+                            trade_side=trade_side,
                             purpose="tp",
                             timestamp=utc_now(),
                             client_order_id=ack.client_oid or client_oid,
@@ -752,8 +821,60 @@ class TradeExecutor:
                             parent_client_order_id=parent_client_order_id,
                         )
                     )
+                placed += 1
             except Exception as exc:  # noqa: BLE001
+                skipped += 1
+                last_reason = str(exc)
                 self.logger.warning("place take profit failed symbol=%s tp=%s err=%s", symbol, tp, exc)
+                self._record_tp_event(
+                    event_type="TP_PLACE_FAILED",
+                    level="ERROR",
+                    msg="failed to place TP plan order",
+                    payload={
+                        "symbol": symbol,
+                        "reason": str(exc),
+                        "tp_price": float(tp),
+                        "size": order_size,
+                    },
+                )
+        return {"placed": placed, "skipped": skipped, "last_reason": last_reason}
+
+    def _resolve_total_tp_size(self, symbol: str) -> float | None:
+        if self.runtime_state is not None:
+            pos = self.runtime_state.positions.get(symbol.upper())
+            if pos is not None and pos.size > 0:
+                return float(pos.size)
+        try:
+            position_payload = self.bitget.get_position(symbol)
+            position = self._pick_position(position_payload)
+            size = abs(float(position.get("total", position.get("size", 0)) or 0.0))
+            return size if size > 0 else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _resolve_position_side_hint(self, symbol: str) -> str | None:
+        if self.runtime_state is not None:
+            pos = self.runtime_state.positions.get(symbol.upper())
+            if pos is not None:
+                return "LONG" if pos.side.lower() == "long" else "SHORT"
+        try:
+            position_payload = self.bitget.get_position(symbol)
+            position = self._pick_position(position_payload)
+            hold_side = self._extract_hold_side(position)
+            return "LONG" if hold_side == "long" else "SHORT"
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _record_tp_event(self, *, event_type: str, level: str, msg: str, payload: dict) -> str:
+        trace_id = f"tp-{uuid.uuid4().hex[:12]}"
+        self.store.record_event(
+            event_type=event_type,
+            level=level,
+            msg=msg,
+            payload=payload,
+            trace_id=trace_id,
+        )
+        return trace_id
 
     @staticmethod
     def _to_float(payload: dict, keys: list[str]) -> float | None:

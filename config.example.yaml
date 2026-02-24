@@ -26,6 +26,10 @@ bitget:
   margin_mode: "isolated"
   position_mode: "one_way_mode"
   force: "gtc"
+  plan_orders_probe_on_startup: true
+  plan_orders_capability_ttl_seconds: 300
+  plan_orders_probe_timeout_seconds: 6
+  plan_orders_probe_safe_mode_on_failure: true
 
 filters:
   symbol_policy: "ALLOWLIST"
@@ -85,6 +89,9 @@ monitor:
     interval_seconds: 2
     ws_reconnect_seconds: 3
     max_stale_seconds: 5
+    max_ws_parse_error_ratio: 0.2
+    ws_required_for_local_guard: true
+    required_symbols: []
     rest_fallback_action_when_local_guard: "safe_mode"  # notify_only / safe_mode
   health:
     host: "127.0.0.1"

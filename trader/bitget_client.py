@@ -28,9 +28,49 @@ class BitgetClient:
         self.max_retries = max_retries
         self.session = requests.Session()
         self.rate_limiter = rate_limiter or TokenBucketRateLimiter(rate_per_sec=8.0, capacity=16.0)
+        self._plan_capability_state: dict[str, Any] = {
+            "supported": None,  # True / False / None(unknown)
+            "ok": False,
+            "ts": 0.0,
+            "expires_at": 0.0,
+            "reason": "uninitialized",
+        }
 
     def supports_plan_orders(self) -> bool:
-        return True
+        state = self._plan_capability_state
+        now = time.time()
+        if now < float(state.get("expires_at", 0.0)):
+            return state.get("supported") is True
+        refreshed = self.probe_plan_orders_capability()
+        return refreshed.get("supported") is True
+
+    def probe_plan_orders_capability(self, force: bool = False) -> dict[str, Any]:
+        state = self._plan_capability_state
+        now = time.time()
+        if not force and now < float(state.get("expires_at", 0.0)):
+            return dict(state)
+
+        try:
+            data = self._request(
+                "GET",
+                "/api/v2/mix/order/orders-plan-pending",
+                params={"productType": self.config.product_type},
+                auth=True,
+                timeout_override=self.config.plan_orders_probe_timeout_seconds,
+            )
+            if isinstance(data, list) or isinstance(data, dict):
+                return self._set_plan_capability(True, "ok", ttl=self.config.plan_orders_capability_ttl_seconds)
+            return self._set_plan_capability(
+                False,
+                "invalid_response_structure",
+                ttl=self.config.plan_orders_capability_ttl_seconds,
+            )
+        except Exception as exc:  # noqa: BLE001
+            reason, supported, ttl = self._classify_plan_probe_error(str(exc))
+            return self._set_plan_capability(supported, reason, ttl=ttl)
+
+    def get_plan_orders_capability_state(self) -> dict[str, Any]:
+        return dict(self._plan_capability_state)
 
     def get_ticker_price(self, symbol: str) -> float:
         data = self._request(
@@ -449,6 +489,7 @@ class BitgetClient:
         params: dict[str, Any] | None = None,
         body: dict[str, Any] | None = None,
         auth: bool = False,
+        timeout_override: int | None = None,
     ) -> Any:
         method = method.upper()
         params = params or {}
@@ -483,7 +524,7 @@ class BitgetClient:
                     url,
                     headers=headers,
                     data=data if data else None,
-                    timeout=self.timeout,
+                    timeout=timeout_override if timeout_override is not None else self.timeout,
                 )
 
                 if response.status_code == 429:
@@ -503,6 +544,41 @@ class BitgetClient:
                     break
                 time.sleep(exponential_backoff_seconds(attempt))
         raise RuntimeError(f"Bitget request failed after retries: {last_error}")
+
+    def _set_plan_capability(self, supported: bool | None, reason: str, ttl: int) -> dict[str, Any]:
+        now = time.time()
+        state = {
+            "supported": supported,
+            "ok": supported is True,
+            "ts": now,
+            "expires_at": now + max(ttl, 1),
+            "reason": reason,
+        }
+        self._plan_capability_state = state
+        return dict(state)
+
+    def _classify_plan_probe_error(self, message: str) -> tuple[str, bool | None, int]:
+        msg = message.lower()
+        normal_ttl = self.config.plan_orders_capability_ttl_seconds
+        short_ttl = max(5, min(30, normal_ttl // 10 if normal_ttl > 10 else 5))
+
+        if "http 404" in msg or "not found" in msg or "api does not exist" in msg:
+            return "endpoint_not_found", False, normal_ttl
+        if "http 401" in msg or "http 403" in msg or "permission" in msg or "forbidden" in msg:
+            return "permission_denied", False, normal_ttl
+
+        network_tokens = [
+            "timeout",
+            "timed out",
+            "connection",
+            "temporarily unavailable",
+            "name or service",
+            "network",
+        ]
+        if any(token in msg for token in network_tokens):
+            return "network_error", None, short_ttl
+
+        return "probe_failed", False, normal_ttl
 
     def _sign(self, timestamp: str, method: str, path: str, query_string: str, body: str) -> str:
         request_path = path if not query_string else f"{path}?{query_string}"

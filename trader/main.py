@@ -28,6 +28,7 @@ from trader.risk import RiskManager
 from trader.risk_daemon import RiskDaemon
 from trader.signal_validator import validate_parsed_message
 from trader.state import StateStore
+from trader.startup_probe import probe_plan_order_capability_on_startup
 from trader.stoploss_manager import StopLossManager
 from trader.store import SQLiteStore
 from trader.symbol_registry import SymbolRegistry
@@ -91,6 +92,13 @@ async def _run_async(config_path: Path) -> None:
         symbol_registry.refresh(force=True)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Initial SymbolRegistry refresh failed: %s", exc)
+
+    probe_plan_order_capability_on_startup(
+        config=config,
+        bitget=bitget,
+        alerts=alerts,
+        runtime_state=runtime_state,
+    )
 
     risk_manager = RiskManager(config, symbol_registry=symbol_registry)
     stoploss_manager = StopLossManager(

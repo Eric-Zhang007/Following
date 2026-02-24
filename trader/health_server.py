@@ -90,8 +90,14 @@ class HealthServer:
     def _ready_payload(self) -> dict:
         now = utc_now()
         pi = self.config.monitor.poll_intervals
-        max_stale = self.config.monitor.price_feed.max_stale_seconds
+        pf = self.config.monitor.price_feed
+        max_stale = pf.max_stale_seconds
         sl_covered = self._sl_covered()
+        reasons: list[str] = []
+        parse_error_ratio = 0.0
+        if self.state.ws_messages_total > 0:
+            parse_error_ratio = self.state.ws_parse_errors_total / self.state.ws_messages_total
+
         checks = {
             "account": _is_fresh(self.state.last_account_ok_at, pi.account_seconds, now),
             "positions": _is_fresh(self.state.last_positions_ok_at, pi.positions_seconds, now),
@@ -101,6 +107,36 @@ class HealthServer:
             "ws_mode_or_rest": (self.state.price_feed_mode == "ws" and not self.state.price_feed_degraded)
             or self.state.price_feed_mode == "rest",
         }
+
+        if pf.mode == "ws" and self.state.ws_messages_total > 0 and parse_error_ratio > pf.max_ws_parse_error_ratio:
+            checks["ws_parse_error_ratio"] = False
+            reasons.append(
+                f"ws_parse_error_ratio_too_high:{parse_error_ratio:.3f}>{pf.max_ws_parse_error_ratio:.3f}"
+            )
+        else:
+            checks["ws_parse_error_ratio"] = True
+
+        required_symbols = pf.required_symbols
+        if required_symbols and pf.mode == "ws":
+            stale_symbols = [s for s in required_symbols if not self._is_symbol_ws_fresh(s, now, max_stale)]
+            checks["required_symbols_fresh"] = len(stale_symbols) == 0
+            if stale_symbols:
+                reasons.append(f"required_symbols_stale:{','.join(stale_symbols)}")
+        else:
+            checks["required_symbols_fresh"] = True
+
+        if self.config.risk.stoploss.sl_order_type == "local_guard" and pf.ws_required_for_local_guard:
+            ws_ok = self.state.price_feed_mode == "ws" and not self.state.price_feed_degraded
+            checks["local_guard_ws_required"] = ws_ok
+            if not ws_ok:
+                reasons.append("local_guard_requires_ws")
+        else:
+            checks["local_guard_ws_required"] = True
+
+        for key, ok in checks.items():
+            if not ok and key not in {"ws_parse_error_ratio", "required_symbols_fresh", "local_guard_ws_required"}:
+                reasons.append(f"check_failed:{key}")
+
         return {
             "ready": all(checks.values()),
             "checks": checks,
@@ -109,6 +145,8 @@ class HealthServer:
             "reason": self.state.block_new_entries_reason,
             "price_feed_mode": self.state.price_feed_mode,
             "price_feed_degraded": self.state.price_feed_degraded,
+            "ws_parse_error_ratio": parse_error_ratio,
+            "reasons": reasons,
         }
 
     def _sl_covered(self) -> bool:
@@ -118,6 +156,12 @@ class HealthServer:
             if not self.state.has_valid_stop_loss(pos.symbol, pos.side):
                 return False
         return True
+
+    def _is_symbol_ws_fresh(self, symbol: str, now: datetime, max_stale_seconds: int) -> bool:
+        ts = self.state.last_ws_snapshot_at_by_symbol.get(symbol.upper())
+        if ts is None:
+            return False
+        return (now - ts).total_seconds() <= max_stale_seconds
 
 
 def _is_fresh(last_ok: datetime | None, interval_seconds: int, now: datetime) -> bool:

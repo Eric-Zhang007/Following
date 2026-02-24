@@ -39,6 +39,10 @@ class BitgetConfig(BaseModel):
     margin_mode: Literal["isolated", "crossed"] = "isolated"
     position_mode: Literal["one_way_mode", "hedge_mode"] = "one_way_mode"
     force: Literal["gtc", "ioc", "fok", "post_only"] = "gtc"
+    plan_orders_probe_on_startup: bool = True
+    plan_orders_capability_ttl_seconds: int = Field(default=300, ge=10, le=86400)
+    plan_orders_probe_timeout_seconds: int = Field(default=6, ge=1, le=30)
+    plan_orders_probe_safe_mode_on_failure: bool = True
 
 
 class FiltersConfig(BaseModel):
@@ -196,7 +200,15 @@ class MonitorPriceFeedConfig(BaseModel):
     interval_seconds: int = Field(default=2, ge=1, le=60)
     ws_reconnect_seconds: int = Field(default=3, ge=1, le=60)
     max_stale_seconds: int = Field(default=5, ge=1, le=120)
+    max_ws_parse_error_ratio: float = Field(default=0.2, ge=0.0, le=1.0)
+    ws_required_for_local_guard: bool = True
+    required_symbols: list[str] = Field(default_factory=list)
     rest_fallback_action_when_local_guard: Literal["notify_only", "safe_mode"] = "safe_mode"
+
+    @field_validator("required_symbols")
+    @classmethod
+    def normalize_required_symbols(cls, value: list[str]) -> list[str]:
+        return [v.strip().upper().replace("/", "") for v in value if v.strip()]
 
 
 class MonitorHealthConfig(BaseModel):
