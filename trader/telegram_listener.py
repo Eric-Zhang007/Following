@@ -39,12 +39,25 @@ class TelegramListener:
                 return
 
             event_time = event.message.date if event.message and event.message.date else datetime.now(timezone.utc)
+            reply_to_msg_id = None
+            if event.message and getattr(event.message, "reply_to", None) is not None:
+                reply_to_msg_id = getattr(event.message.reply_to, "reply_to_msg_id", None)
+            media_type = "none"
+            if event.message and getattr(event.message, "photo", None) is not None:
+                media_type = "photo"
+            elif event.message and getattr(event.message, "sticker", None) is not None:
+                media_type = "sticker"
+            elif event.message and getattr(event.message, "media", None) is not None:
+                media_type = "document"
             wrapped = TelegramEvent(
                 chat_id=int(event.chat_id or 0),
                 message_id=int(event.id),
                 text=event.raw_text or "",
+                raw_text=event.raw_text or "",
                 is_edit=is_edit,
                 date=event_time,
+                reply_to_msg_id=reply_to_msg_id,
+                media_type=media_type,
             )
             await on_event(wrapped)
         except Exception:  # noqa: BLE001

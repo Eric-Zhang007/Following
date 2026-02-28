@@ -52,8 +52,9 @@ class RiskDaemon:
 
     async def tick_once(self) -> None:
         self._apply_kill_switch()
-        self._check_api_error_burst()
-        self._check_drawdown_and_margin()
+        if self.config.risk.enabled:
+            self._check_api_error_burst()
+            self._check_drawdown_and_margin()
 
         # local_guard stop-loss processing is part of SL reliability guarantees.
         self.stoploss_manager.process_local_guards()
@@ -137,13 +138,14 @@ class RiskDaemon:
                 )
 
     async def _check_position_invariants(self, position: PositionState) -> None:
-        if self._is_liq_too_close(position):
+        if self.config.risk.enabled and self._is_liq_too_close(position):
             reduced = await self._reduce_position_once(position, reason="liquidation_distance_too_close")
             if not reduced:
                 await self._protective_close(position, reason="liquidation_distance_too_close")
             return
 
-        if not self.config.risk.stoploss.must_exist:
+        require_sl = self.config.risk.stoploss.must_exist or self.config.risk.hard_invariants.require_stoploss
+        if not require_sl:
             return
 
         if self.state.has_valid_stop_loss(position.symbol, position.side):
@@ -184,6 +186,16 @@ class RiskDaemon:
             payload={"purpose": "sl", "mode": result.mode, "ok": result.ok},
             trace_id=result.trace_id,
         )
+        if not result.ok:
+            self.alerts.error(
+                "STOPLOSS_PLACE_FAIL",
+                "stoploss placement failed during invariant check",
+                {
+                    "symbol": position.symbol,
+                    "purpose": "sl",
+                    "reason": result.reason,
+                },
+            )
 
         if result.ok:
             return
@@ -267,6 +279,16 @@ class RiskDaemon:
             return False
 
     async def _protective_close(self, position: PositionState, reason: str) -> None:
+        self.alerts.critical(
+            "PANIC_CLOSE",
+            "panic close requested",
+            {
+                "symbol": position.symbol,
+                "purpose": "emergency_close",
+                "reason": reason,
+                "size": position.size,
+            },
+        )
         trace = self.alerts.critical(
             "PROTECTIVE_CLOSE",
             "triggering protective close",

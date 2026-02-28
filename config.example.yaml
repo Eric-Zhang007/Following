@@ -1,7 +1,7 @@
 dry_run: true
 
 listener:
-  mode: "web_preview"           # telegram / web_preview
+  mode: "telegram_private"      # telegram_private / telegram / web_preview
   polling_seconds: 5
   target_url: "https://t.me/s/IvanCryptotalk"
   user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) FollowingBot/1.0"
@@ -14,6 +14,10 @@ telegram:
   api_id: null                   # web_preview 模式下可为空
   api_hash: null                 # web_preview 模式下可为空
   session_name: "ivan_listener"
+  channel_id: -1000000000000     # 私有频道必须填写 -100xxxxxxxxxx
+  channel_title_hint: null
+  accept_only_after_startup: true
+  enable_edited_events: true
   channel: "@IvanCryptotalk"
   notify_chat_id: null
 
@@ -43,6 +47,7 @@ filters:
   leverage_over_limit_action: "CLAMP"
 
 risk:
+  enabled: true
   max_account_drawdown_pct: 0.15
   account_risk_per_trade: 0.003
   max_leverage: 10
@@ -73,6 +78,11 @@ risk:
     api_error_burst: 10
     api_error_window_seconds: 120
   assumed_equity_usdt: 1000
+  hard_invariants:
+    require_stoploss: true
+    max_concurrent_trades_enforced: true
+    kill_switch_enforced: true
+    no_size_zero_orders: true
 
 monitor:
   enabled: true
@@ -112,6 +122,16 @@ storage:
   media_dir: "media"
 
 execution:
+  margin_mode: "cross"
+  per_trade_margin_usdt: 25
+  entry_split_ratio: [1, 2]
+  order_type: "limit_only"
+  max_concurrent_trades: 3
+  place_tp_on_fill: true
+  be_reduce_on_two_entries: true
+  be_reduce_pct: 50
+  be_reduce_trigger_type: "mark"
+  be_reduce_buffer_pct: 0.0
   limit_price_strategy: "MID"   # MID / LOW / HIGH
   require_order_ack: true
   ack_timeout_seconds: 8
@@ -144,3 +164,21 @@ vlm:
   max_retries: 2
   confidence_threshold: 0.8
   below_threshold_action: "notify_only"
+
+alerts:
+  email:
+    enabled: false
+    smtp_host: "smtp.example.com"
+    smtp_port: 587
+    smtp_user: "bot@example.com"
+    smtp_pass_env: "SMTP_PASS"
+    from_addr: "bot@example.com"
+    to_addrs: ["risk@example.com"]
+    send_on:
+      - "RISK_MODE_DISABLED"
+      - "CROSS_MARGIN"
+      - "HIGH_LEVERAGE"
+      - "STOPLOSS_PLACE_FAIL"
+      - "PANIC_CLOSE"
+      - "PLAN_ORDER_FALLBACK"
+      - "WS_DEGRADED"

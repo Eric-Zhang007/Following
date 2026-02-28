@@ -47,6 +47,8 @@ class OrderState:
     trigger_price: float | None = None
     is_plan_order: bool = False
     parent_client_order_id: str | None = None
+    thread_id: int | None = None
+    entry_index: int | None = None
 
 
 @dataclass

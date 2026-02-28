@@ -29,6 +29,35 @@ class RiskManager:
         side = signal.side.value
         warnings: list[str] = []
 
+        if not self.config.risk.enabled:
+            entry_price = self._pick_limit_price(signal)
+            if entry_price <= 0:
+                return RiskDecision.reject("entry_price <= 0")
+            stop_loss_price, stop_distance = self._resolve_stop_loss(signal, entry_price)
+            if self.config.risk.hard_invariants.require_stoploss and (stop_loss_price is None or stop_distance <= 0):
+                return RiskDecision.reject("hard invariant require_stoploss failed")
+            leverage = signal.leverage or 1
+            notional = min(
+                float(self.config.risk.max_notional_per_trade),
+                float(max(account_equity, 0.0) * max(self.config.risk.account_risk_per_trade, 0.0) * max(leverage, 1)),
+            )
+            quantity = (notional / entry_price) if entry_price > 0 else 0.0
+            if self.config.risk.hard_invariants.no_size_zero_orders and quantity <= 0:
+                return RiskDecision.reject("hard invariant no_size_zero_orders failed")
+            return RiskDecision(
+                approved=True,
+                symbol=symbol,
+                side=signal.side,
+                leverage=leverage,
+                notional=notional,
+                quantity=quantity,
+                entry_price=entry_price,
+                stop_loss_price=stop_loss_price,
+                stop_distance_ratio=stop_distance,
+                quality_score=signal_quality,
+                warnings=["risk.enabled=false bypassed strategy filters"],
+            )
+
         if symbol in self._symbol_blacklist():
             return RiskDecision.reject(f"symbol in blacklist: {symbol}")
 

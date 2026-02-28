@@ -11,12 +11,17 @@ class TelegramConfig(BaseModel):
     api_id: int | None = None
     api_hash: str | None = None
     session_name: str = "ivan_listener"
+    channel_id: int | None = None
+    channel_title_hint: str | None = None
+    accept_only_after_startup: bool = True
+    enable_edited_events: bool = True
+    # Legacy field kept for compatibility with old telegram mode.
     channel: str = "@IvanCryptotalk"
     notify_chat_id: int | None = None
 
 
 class ListenerConfig(BaseModel):
-    mode: Literal["telegram", "web_preview"] = "telegram"
+    mode: Literal["telegram_private", "telegram", "web_preview"] = "telegram"
     polling_seconds: int = Field(default=5, ge=1, le=300)
     target_url: str = "https://t.me/s/IvanCryptotalk"
     user_agent: str = (
@@ -68,6 +73,13 @@ class FiltersConfig(BaseModel):
 
 
 class RiskConfig(BaseModel):
+    class HardInvariantsConfig(BaseModel):
+        require_stoploss: bool = True
+        max_concurrent_trades_enforced: bool = True
+        kill_switch_enforced: bool = True
+        no_size_zero_orders: bool = True
+
+    enabled: bool = True
     max_account_drawdown_pct: float = Field(default=0.15, ge=0, le=1)
     account_risk_per_trade: float = Field(default=0.003, ge=0, le=1)
     max_leverage: int = Field(default=10, ge=1, le=125)
@@ -107,6 +119,7 @@ class RiskConfig(BaseModel):
 
     stoploss: StopLossConfig = Field(default_factory=StopLossConfig)
     circuit_breaker: CircuitBreakerConfig = Field(default_factory=CircuitBreakerConfig)
+    hard_invariants: HardInvariantsConfig = Field(default_factory=HardInvariantsConfig)
 
     @field_validator("symbol_allowlist")
     @classmethod
@@ -146,12 +159,31 @@ class StorageConfig(BaseModel):
 
 
 class ExecutionConfig(BaseModel):
+    margin_mode: Literal["cross", "isolated"] = "cross"
+    per_trade_margin_usdt: float = Field(default=25, gt=0)
+    entry_split_ratio: list[int] = Field(default_factory=lambda: [1, 2])
+    order_type: Literal["limit_only"] = "limit_only"
+    max_concurrent_trades: int = Field(default=3, ge=1, le=100)
+    place_tp_on_fill: bool = True
+    be_reduce_on_two_entries: bool = True
+    be_reduce_pct: float = Field(default=50.0, gt=0, le=100)
+    be_reduce_trigger_type: Literal["mark", "last"] = "mark"
+    be_reduce_buffer_pct: float = Field(default=0.0, ge=0, le=0.05)
     limit_price_strategy: Literal["MID", "LOW", "HIGH"] = "MID"
     require_order_ack: bool = True
     ack_timeout_seconds: int = Field(default=8, ge=1, le=120)
     max_submit_retries: int = Field(default=2, ge=0, le=10)
     prefer_post_only_limit: bool = False
     close_on_invariant_violation: bool = True
+
+    @field_validator("entry_split_ratio")
+    @classmethod
+    def validate_entry_split_ratio(cls, value: list[int]) -> list[int]:
+        if not value:
+            raise ValueError("entry_split_ratio must not be empty")
+        if any(v <= 0 for v in value):
+            raise ValueError("entry_split_ratio values must be > 0")
+        return value
 
 
 class LLMConfig(BaseModel):
@@ -231,6 +263,31 @@ class MonitorConfig(BaseModel):
     alerts: MonitorAlertsConfig = Field(default_factory=MonitorAlertsConfig)
 
 
+class EmailAlertConfig(BaseModel):
+    enabled: bool = False
+    smtp_host: str = ""
+    smtp_port: int = Field(default=587, ge=1, le=65535)
+    smtp_user: str = ""
+    smtp_pass_env: str = "SMTP_PASS"
+    from_addr: str = ""
+    to_addrs: list[str] = Field(default_factory=list)
+    send_on: list[str] = Field(
+        default_factory=lambda: [
+            "RISK_MODE_DISABLED",
+            "CROSS_MARGIN",
+            "HIGH_LEVERAGE",
+            "STOPLOSS_PLACE_FAIL",
+            "PANIC_CLOSE",
+            "PLAN_ORDER_FALLBACK",
+            "WS_DEGRADED",
+        ]
+    )
+
+
+class AlertsConfig(BaseModel):
+    email: EmailAlertConfig = Field(default_factory=EmailAlertConfig)
+
+
 class AppConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -246,12 +303,18 @@ class AppConfig(BaseModel):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     vlm: VLMConfig = Field(default_factory=VLMConfig)
     monitor: MonitorConfig = Field(default_factory=MonitorConfig)
+    alerts: AlertsConfig = Field(default_factory=AlertsConfig)
 
     @model_validator(mode="after")
     def validate_listener_requirements(self) -> "AppConfig":
-        if self.listener.mode == "telegram":
+        if self.listener.mode in {"telegram", "telegram_private"}:
             if not self.telegram.api_id or not self.telegram.api_hash:
-                raise ValueError("telegram.api_id and telegram.api_hash are required when listener.mode=telegram")
+                raise ValueError(
+                    "telegram.api_id and telegram.api_hash are required when listener.mode in {telegram, telegram_private}"
+                )
+        if self.listener.mode == "telegram_private":
+            if self.telegram.channel_id is None:
+                raise ValueError("telegram.channel_id is required when listener.mode=telegram_private")
         return self
 
 

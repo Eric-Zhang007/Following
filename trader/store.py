@@ -92,7 +92,9 @@ class SQLiteStore:
                 chat_id INTEGER NOT NULL,
                 message_id INTEGER NOT NULL,
                 version INTEGER NOT NULL,
+                thread_id INTEGER,
                 action_type TEXT NOT NULL,
+                purpose TEXT,
                 symbol TEXT,
                 side TEXT,
                 status TEXT NOT NULL,
@@ -137,6 +139,8 @@ class SQLiteStore:
                 type TEXT NOT NULL,
                 level TEXT NOT NULL,
                 msg TEXT NOT NULL,
+                reason TEXT,
+                thread_id INTEGER,
                 payload_json TEXT,
                 trace_id TEXT,
                 created_at TEXT NOT NULL
@@ -162,14 +166,40 @@ class SQLiteStore:
 
             CREATE TABLE IF NOT EXISTS reconciler_actions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                thread_id INTEGER,
                 symbol TEXT,
                 order_id TEXT,
                 client_order_id TEXT,
                 action TEXT NOT NULL,
+                purpose TEXT,
                 reason TEXT,
                 payload_json TEXT,
                 trace_id TEXT,
                 created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS trade_threads (
+                thread_id INTEGER PRIMARY KEY,
+                symbol TEXT,
+                side TEXT,
+                leverage INTEGER,
+                stop_loss REAL,
+                entry_points_json TEXT,
+                tp_points_json TEXT,
+                target_version INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                status TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS thread_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                thread_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL UNIQUE,
+                is_root INTEGER NOT NULL,
+                kind TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(thread_id) REFERENCES trade_threads(thread_id)
             );
 
             CREATE TABLE IF NOT EXISTS runtime_state_snapshots (
@@ -189,6 +219,16 @@ class SQLiteStore:
         # Lightweight migration support for older DBs.
         self._ensure_column("parsed_signals", "parse_source", "TEXT")
         self._ensure_column("parsed_signals", "confidence", "REAL")
+        self._ensure_column("executions", "thread_id", "INTEGER")
+        self._ensure_column("executions", "purpose", "TEXT")
+        self._ensure_column("events", "reason", "TEXT")
+        self._ensure_column("events", "thread_id", "INTEGER")
+        self._ensure_column("reconciler_actions", "thread_id", "INTEGER")
+        self._ensure_column("reconciler_actions", "purpose", "TEXT")
+        self._ensure_column("trade_threads", "target_version", "INTEGER NOT NULL DEFAULT 1")
+        self._ensure_column("trade_threads", "stop_loss", "REAL")
+        self._ensure_column("trade_threads", "entry_points_json", "TEXT")
+        self._ensure_column("trade_threads", "tp_points_json", "TEXT")
 
         self.conn.commit()
 
@@ -398,18 +438,24 @@ class SQLiteStore:
         status: str,
         reason: str | None,
         intent: dict[str, Any] | None,
+        thread_id: int | None = None,
+        purpose: str | None = None,
     ) -> int:
         cur = self.conn.cursor()
         cur.execute(
             """
-            INSERT INTO executions(chat_id, message_id, version, action_type, symbol, side, status, reason, intent_json, created_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?)
+            INSERT INTO executions(
+                chat_id, message_id, version, thread_id, action_type, purpose, symbol, side, status, reason, intent_json, created_at
+            )
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 chat_id,
                 message_id,
                 version,
+                thread_id,
                 action_type,
+                purpose,
                 symbol,
                 side,
                 status,
@@ -438,17 +484,21 @@ class SQLiteStore:
         msg: str,
         payload: dict[str, Any] | None = None,
         trace_id: str | None = None,
+        reason: str | None = None,
+        thread_id: int | None = None,
     ) -> int:
         cur = self.conn.cursor()
         cur.execute(
             """
-            INSERT INTO events(type, level, msg, payload_json, trace_id, created_at)
-            VALUES(?,?,?,?,?,?)
+            INSERT INTO events(type, level, msg, reason, thread_id, payload_json, trace_id, created_at)
+            VALUES(?,?,?,?,?,?,?,?)
             """,
             (
                 event_type,
                 level,
                 msg,
+                reason,
+                thread_id,
                 json.dumps(payload, ensure_ascii=False, default=str) if payload is not None else None,
                 trace_id,
                 self._now_iso(),
@@ -502,18 +552,24 @@ class SQLiteStore:
         reason: str | None = None,
         payload: dict[str, Any] | None = None,
         trace_id: str | None = None,
+        thread_id: int | None = None,
+        purpose: str | None = None,
     ) -> int:
         cur = self.conn.cursor()
         cur.execute(
             """
-            INSERT INTO reconciler_actions(symbol, order_id, client_order_id, action, reason, payload_json, trace_id, created_at)
-            VALUES(?,?,?,?,?,?,?,?)
+            INSERT INTO reconciler_actions(
+                thread_id, symbol, order_id, client_order_id, action, purpose, reason, payload_json, trace_id, created_at
+            )
+            VALUES(?,?,?,?,?,?,?,?,?,?)
             """,
             (
+                thread_id,
                 symbol,
                 order_id,
                 client_order_id,
                 action,
+                purpose,
                 reason,
                 json.dumps(payload, ensure_ascii=False, default=str) if payload is not None else None,
                 trace_id,
@@ -651,6 +707,180 @@ class SQLiteStore:
         )
         row = cur.fetchone()
         return str(row["symbol"]) if row else None
+
+    def upsert_trade_thread(
+        self,
+        *,
+        thread_id: int,
+        symbol: str | None,
+        side: str | None,
+        leverage: int | None,
+        stop_loss: float | None = None,
+        entry_points: list[float] | None = None,
+        tp_points: list[float] | None = None,
+        status: str = "ACTIVE",
+        target_version: int = 1,
+    ) -> None:
+        now = self._now_iso()
+        self.conn.execute(
+            """
+            INSERT INTO trade_threads(
+                thread_id, symbol, side, leverage, stop_loss, entry_points_json, tp_points_json,
+                target_version, created_at, updated_at, status
+            )
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(thread_id) DO UPDATE SET
+                symbol=COALESCE(excluded.symbol, trade_threads.symbol),
+                side=COALESCE(excluded.side, trade_threads.side),
+                leverage=COALESCE(excluded.leverage, trade_threads.leverage),
+                stop_loss=COALESCE(excluded.stop_loss, trade_threads.stop_loss),
+                entry_points_json=COALESCE(excluded.entry_points_json, trade_threads.entry_points_json),
+                tp_points_json=COALESCE(excluded.tp_points_json, trade_threads.tp_points_json),
+                target_version=MAX(excluded.target_version, trade_threads.target_version),
+                updated_at=excluded.updated_at,
+                status=excluded.status
+            """,
+            (
+                thread_id,
+                symbol,
+                side,
+                leverage,
+                stop_loss,
+                json.dumps(entry_points, ensure_ascii=False, default=str) if entry_points is not None else None,
+                json.dumps(tp_points, ensure_ascii=False, default=str) if tp_points is not None else None,
+                int(target_version),
+                now,
+                now,
+                status,
+            ),
+        )
+        self.conn.commit()
+
+    def get_trade_thread(self, thread_id: int) -> dict[str, Any] | None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                thread_id, symbol, side, leverage, stop_loss, entry_points_json, tp_points_json,
+                target_version, created_at, updated_at, status
+            FROM trade_threads
+            WHERE thread_id=?
+            LIMIT 1
+            """,
+            (thread_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        return {
+            "thread_id": int(row["thread_id"]),
+            "symbol": row["symbol"],
+            "side": row["side"],
+            "leverage": row["leverage"],
+            "stop_loss": row["stop_loss"],
+            "entry_points": json.loads(row["entry_points_json"]) if row["entry_points_json"] else [],
+            "tp_points": json.loads(row["tp_points_json"]) if row["tp_points_json"] else [],
+            "target_version": int(row["target_version"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "status": row["status"],
+        }
+
+    def set_trade_thread_status(self, thread_id: int, status: str) -> None:
+        self.conn.execute(
+            "UPDATE trade_threads SET status=?, updated_at=? WHERE thread_id=?",
+            (status, self._now_iso(), thread_id),
+        )
+        self.conn.commit()
+
+    def bump_trade_thread_version(self, thread_id: int) -> int:
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT target_version FROM trade_threads WHERE thread_id=? LIMIT 1",
+            (thread_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            version = 1
+            self.upsert_trade_thread(
+                thread_id=thread_id,
+                symbol=None,
+                side=None,
+                leverage=None,
+                status="ACTIVE",
+                target_version=version,
+            )
+            return version
+        version = int(row["target_version"]) + 1
+        self.conn.execute(
+            "UPDATE trade_threads SET target_version=?, updated_at=? WHERE thread_id=?",
+            (version, self._now_iso(), thread_id),
+        )
+        self.conn.commit()
+        return version
+
+    def count_active_trade_threads(self) -> int:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM trade_threads
+            WHERE status IN ('ACTIVE', 'PARTIAL', 'PENDING_ENTRY', 'RUNNING')
+            """
+        )
+        row = cur.fetchone()
+        return int(row["c"]) if row else 0
+
+    def record_thread_message(
+        self,
+        *,
+        thread_id: int,
+        message_id: int,
+        is_root: bool,
+        kind: str,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT OR IGNORE INTO thread_messages(thread_id, message_id, is_root, kind, created_at)
+            VALUES(?,?,?,?,?)
+            """,
+            (thread_id, message_id, 1 if is_root else 0, kind, self._now_iso()),
+        )
+        self.conn.commit()
+
+    def resolve_thread_root_by_message(self, message_id: int) -> int | None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT thread_id
+            FROM thread_messages
+            WHERE message_id=?
+            LIMIT 1
+            """,
+            (message_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        return int(row["thread_id"])
+
+    def resolve_thread_root_by_reply(self, reply_to_msg_id: int | None) -> int | None:
+        if reply_to_msg_id is None:
+            return None
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT thread_id
+            FROM trade_threads
+            WHERE thread_id=?
+            LIMIT 1
+            """,
+            (reply_to_msg_id,),
+        )
+        row = cur.fetchone()
+        if row is not None:
+            return int(row["thread_id"])
+        return self.resolve_thread_root_by_message(reply_to_msg_id)
 
     def close(self) -> None:
         self.conn.close()

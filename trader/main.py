@@ -7,7 +7,7 @@ import signal
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import typer
 
@@ -15,6 +15,7 @@ from trader.account_poller import AccountPoller
 from trader.alerts import AlertManager
 from trader.bitget_client import BitgetClient
 from trader.config import AppConfig, load_config
+from trader.email_alert import SMTPAlertSender
 from trader.executor import TradeExecutor
 from trader.health_server import HealthServer
 from trader.kill_switch import KillSwitch
@@ -23,6 +24,7 @@ from trader.media import MediaManager
 from trader.models import EntrySignal, ManageAction, NeedsManual, NonSignal, ParsedKind, ParsedMessage, TelegramEvent, utc_now
 from trader.notifier import Notifier
 from trader.order_reconciler import OrderReconciler
+from trader.private_channel_parser import PrivateChannelParser
 from trader.price_feed import PriceFeed
 from trader.risk import RiskManager
 from trader.risk_daemon import RiskDaemon
@@ -33,6 +35,8 @@ from trader.stoploss_manager import StopLossManager
 from trader.store import SQLiteStore
 from trader.symbol_registry import SymbolRegistry
 from trader.telegram_listener import TelegramListener
+from trader.telegram_private_listener import TelegramPrivateListener
+from trader.threading_router import TradeThreadRouter
 from trader.web_preview_listener import WebPreviewListener
 
 app = typer.Typer(add_completion=False, help="Telegram/WebPreview signal -> Bitget executor")
@@ -73,10 +77,19 @@ async def _run_async(config_path: Path) -> None:
     notifier = Notifier(logger)
 
     store = SQLiteStore(config.storage.db_path)
-    alerts = AlertManager(notifier=notifier, store=store, logger=logger, min_level=config.monitor.alerts.level)
+    email_sender = SMTPAlertSender(config.alerts.email)
+    alerts = AlertManager(
+        notifier=notifier,
+        store=store,
+        logger=logger,
+        min_level=config.monitor.alerts.level,
+        email_sender=email_sender,
+    )
     runtime_state = StateStore()
 
     parser_engine = HybridSignalParser(config, store, logger)
+    private_parser = PrivateChannelParser(config)
+    thread_router = TradeThreadRouter(store)
     bitget = BitgetClient(config.bitget)
     symbol_registry = SymbolRegistry(bitget, logger)
     media_manager = MediaManager(
@@ -166,7 +179,30 @@ async def _run_async(config_path: Path) -> None:
         config.monitor.enabled,
     )
 
+    if not config.risk.enabled:
+        alerts.error(
+            "RISK_MODE_DISABLED",
+            "risk.enabled=false, strategy risk checks are disabled",
+            {
+                "hard_invariants": config.risk.hard_invariants.model_dump(mode="json"),
+            },
+        )
+
     async def on_event(event: TelegramEvent) -> None:
+        if config.listener.mode == "telegram_private":
+            await _handle_private_event(
+                config=config,
+                store=store,
+                parser=private_parser,
+                thread_router=thread_router,
+                risk_manager=risk_manager,
+                executor=executor,
+                notifier=notifier,
+                alerts=alerts,
+                event=event,
+                runtime_state=runtime_state,
+            )
+            return
         try:
             message_state = store.record_message(
                 chat_id=event.chat_id,
@@ -396,6 +432,12 @@ async def _run_async(config_path: Path) -> None:
 
     if config.listener.mode == "web_preview":
         listener = WebPreviewListener(config.listener, logger)
+    elif config.listener.mode == "telegram_private":
+        listener = TelegramPrivateListener(
+            config.telegram,
+            logger,
+            media_dir=str(Path(config.storage.media_dir) / "telegram_private"),
+        )
     else:
         listener = TelegramListener(config.telegram, logger)
 
@@ -526,6 +568,312 @@ async def _handle_entry(
         notifier.warning(warning)
 
     executor.execute_entry(parsed, decision, chat_id, message_id, version)
+
+
+async def _handle_private_event(
+    *,
+    config: AppConfig,
+    store: SQLiteStore,
+    parser: PrivateChannelParser,
+    thread_router: TradeThreadRouter,
+    risk_manager: RiskManager,
+    executor: TradeExecutor,
+    notifier: Notifier,
+    alerts: AlertManager,
+    event: TelegramEvent,
+    runtime_state: StateStore,
+) -> None:
+    text = (event.raw_text or event.text or "").strip()
+    message_state = store.record_message(
+        chat_id=event.chat_id,
+        message_id=event.message_id,
+        text=text,
+        is_edit=event.is_edit,
+        event_time=event.date,
+    )
+    if message_state.duplicate and not event.is_edit:
+        return
+
+    thread_result = thread_router.resolve(
+        message_id=event.message_id,
+        text=text,
+        reply_to_msg_id=event.reply_to_msg_id,
+    )
+    if thread_result.thread_id is None:
+        store.record_event(
+            event_type="THREAD_MESSAGE_IGNORED",
+            level="INFO",
+            msg="message ignored because no trade thread mapping",
+            payload={"message_id": event.message_id, "reply_to_msg_id": event.reply_to_msg_id},
+            reason=thread_result.reason,
+        )
+        return
+
+    thread_id = thread_result.thread_id
+    event.thread_id = thread_id
+    existing_thread = store.get_trade_thread(thread_id)
+    if (
+        thread_result.is_root
+        and existing_thread is None
+        and config.risk.hard_invariants.max_concurrent_trades_enforced
+        and store.count_active_trade_threads() >= config.execution.max_concurrent_trades
+    ):
+        store.upsert_trade_thread(
+            thread_id=thread_id,
+            symbol=None,
+            side=None,
+            leverage=None,
+            status="REJECTED_LIMIT",
+        )
+        store.record_execution(
+            chat_id=event.chat_id,
+            message_id=event.message_id,
+            version=message_state.version,
+            action_type="ENTRY",
+            symbol=None,
+            side=None,
+            status="REJECTED",
+            reason="max_concurrent_trades reached",
+            intent={"limit": config.execution.max_concurrent_trades},
+            thread_id=thread_id,
+            purpose="entry",
+        )
+        alerts.warn(
+            "MAX_CONCURRENT_TRADES_REJECTED",
+            "entry rejected because active threads reached max_concurrent_trades",
+            {"thread_id": thread_id, "limit": config.execution.max_concurrent_trades},
+        )
+        notifier.warning("ENTRY rejected: max_concurrent_trades reached")
+        return
+
+    if existing_thread is None:
+        store.upsert_trade_thread(
+            thread_id=thread_id,
+            symbol=None,
+            side=None,
+            leverage=None,
+            status="PENDING_ENTRY",
+        )
+    store.record_thread_message(
+        thread_id=thread_id,
+        message_id=event.message_id,
+        is_root=thread_result.is_root,
+        kind="ROOT" if thread_result.is_root else "REPLY",
+    )
+
+    latest_thread = store.get_trade_thread(thread_id)
+    fallback_symbol = (latest_thread or {}).get("symbol") or store.get_last_entry_symbol(event.chat_id)
+    parse_outcome = parser.parse(
+        text=text,
+        timestamp=event.date,
+        image_path=event.media_path,
+        fallback_symbol=fallback_symbol,
+        thread_id=thread_id,
+        is_root=thread_result.is_root,
+    )
+    parsed = parse_outcome.parsed
+    store.record_parsed_signal(
+        event.chat_id,
+        event.message_id,
+        message_state.version,
+        parsed,
+        parse_source=parse_outcome.parse_source,
+        confidence=parse_outcome.confidence,
+    )
+
+    if isinstance(parsed, NeedsManual):
+        store.record_execution(
+            chat_id=event.chat_id,
+            message_id=event.message_id,
+            version=message_state.version,
+            action_type="PARSE",
+            symbol=None,
+            side=None,
+            status="PENDING_MANUAL",
+            reason=parsed.reason,
+            intent={"missing_fields": parsed.missing_fields, "parse_source": parse_outcome.parse_source},
+            thread_id=thread_id,
+            purpose="parse",
+        )
+        return
+
+    if isinstance(parsed, NonSignal):
+        store.record_execution(
+            chat_id=event.chat_id,
+            message_id=event.message_id,
+            version=message_state.version,
+            action_type="PARSE",
+            symbol=None,
+            side=None,
+            status="RECORDED",
+            reason=parsed.note,
+            intent={"parse_source": parse_outcome.parse_source},
+            thread_id=thread_id,
+            purpose="record",
+        )
+        return
+
+    validation_error = validate_parsed_message(parsed)
+    if validation_error:
+        store.record_execution(
+            chat_id=event.chat_id,
+            message_id=event.message_id,
+            version=message_state.version,
+            action_type="ENTRY" if isinstance(parsed, EntrySignal) else "MANAGE",
+            symbol=getattr(parsed, "symbol", None),
+            side=getattr(getattr(parsed, "side", None), "value", None),
+            status="REJECTED",
+            reason=validation_error,
+            intent=_to_dict(parsed),
+            thread_id=thread_id,
+            purpose="validate",
+        )
+        return
+
+    if isinstance(parsed, EntrySignal):
+        parsed.thread_id = thread_id
+        store.upsert_trade_thread(
+            thread_id=thread_id,
+            symbol=parsed.symbol,
+            side=parsed.side.value,
+            leverage=parsed.leverage,
+            stop_loss=parsed.stop_loss,
+            entry_points=parsed.entry_points,
+            tp_points=parsed.tp_points or parsed.take_profit,
+            status="ACTIVE",
+        )
+        _emit_once_per_thread_alert(
+            store=store,
+            thread_id=thread_id,
+            dedupe_key=f"cross_margin:{thread_id}",
+            emit=lambda: alerts.warn(
+                "CROSS_MARGIN",
+                "cross margin mode enabled for this thread",
+                {"thread_id": thread_id, "margin_mode": config.execution.margin_mode},
+            ),
+            should_emit=config.execution.margin_mode == "cross",
+        )
+        _emit_once_per_thread_alert(
+            store=store,
+            thread_id=thread_id,
+            dedupe_key=f"high_leverage:{thread_id}",
+            emit=lambda: alerts.warn(
+                "HIGH_LEVERAGE",
+                "high leverage entry signal received",
+                {"thread_id": thread_id, "symbol": parsed.symbol, "leverage": parsed.leverage},
+            ),
+            should_emit=(parsed.leverage or 0) >= 20,
+        )
+
+        if runtime_state.safe_mode and config.risk.hard_invariants.kill_switch_enforced:
+            store.record_execution(
+                chat_id=event.chat_id,
+                message_id=event.message_id,
+                version=message_state.version,
+                action_type="ENTRY",
+                symbol=parsed.symbol,
+                side=parsed.side.value,
+                status="REJECTED",
+                reason=f"safe_mode active: {runtime_state.block_new_entries_reason or 'risk daemon'}",
+                intent=_to_dict(parsed),
+                thread_id=thread_id,
+                purpose="entry",
+            )
+            return
+
+        if event.is_edit and thread_result.is_root:
+            new_version = store.bump_trade_thread_version(thread_id)
+            store.record_event(
+                event_type="THREAD_TARGET_UPDATED",
+                level="WARN",
+                msg="root signal edited and thread target version bumped",
+                payload={"thread_id": thread_id, "target_version": new_version},
+                reason="root_edited",
+                thread_id=thread_id,
+            )
+            executor.apply_thread_edit(
+                parsed,
+                chat_id=event.chat_id,
+                message_id=event.message_id,
+                version=message_state.version,
+                thread_id=thread_id,
+            )
+            return
+
+        if not thread_result.is_root:
+            store.record_execution(
+                chat_id=event.chat_id,
+                message_id=event.message_id,
+                version=message_state.version,
+                action_type="ENTRY",
+                symbol=parsed.symbol,
+                side=parsed.side.value,
+                status="RECORDED",
+                reason="non_root_entry_ignored",
+                intent=_to_dict(parsed),
+                thread_id=thread_id,
+                purpose="entry",
+            )
+            return
+
+        result = executor.execute_thread_entry(
+            parsed,
+            chat_id=event.chat_id,
+            message_id=event.message_id,
+            version=message_state.version,
+            thread_id=thread_id,
+        )
+        if result.get("placed", 0) > 0:
+            store.set_trade_thread_status(thread_id, "ACTIVE")
+        else:
+            store.set_trade_thread_status(thread_id, "REJECTED")
+        return
+
+    if isinstance(parsed, ManageAction):
+        parsed.thread_id = thread_id
+        thread = store.get_trade_thread(thread_id)
+        if not parsed.symbol and thread and thread.get("symbol"):
+            parsed.symbol = str(thread.get("symbol"))
+        if config.risk.enabled:
+            decision = risk_manager.evaluate_manage(parsed)
+            if not decision.approved:
+                store.record_execution(
+                    chat_id=event.chat_id,
+                    message_id=event.message_id,
+                    version=message_state.version,
+                    action_type="MANAGE",
+                    symbol=parsed.symbol,
+                    side=None,
+                    status="REJECTED",
+                    reason=decision.reason,
+                    intent=_to_dict(parsed),
+                    thread_id=thread_id,
+                    purpose="manage",
+                )
+                return
+        executor.execute_manage(
+            parsed,
+            event.chat_id,
+            event.message_id,
+            message_state.version,
+            thread_id=thread_id,
+        )
+
+
+def _emit_once_per_thread_alert(
+    *,
+    store: SQLiteStore,
+    thread_id: int,
+    dedupe_key: str,
+    emit: Callable[[], None],
+    should_emit: bool,
+) -> None:
+    if not should_emit:
+        return
+    if store.get_system_flag(dedupe_key):
+        return
+    emit()
+    store.set_system_flag(dedupe_key, str(thread_id))
 
 
 def _install_signal_handlers(stop_event: asyncio.Event, logger: logging.Logger) -> None:

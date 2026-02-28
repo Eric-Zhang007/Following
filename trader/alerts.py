@@ -5,6 +5,7 @@ import logging
 import uuid
 from typing import Any
 
+from trader.email_alert import SMTPAlertSender
 from trader.notifier import Notifier
 from trader.store import SQLiteStore
 
@@ -18,11 +19,13 @@ class AlertManager:
         store: SQLiteStore,
         logger: logging.Logger,
         min_level: str = "INFO",
+        email_sender: SMTPAlertSender | None = None,
     ) -> None:
         self.notifier = notifier
         self.store = store
         self.logger = logger
         self.min_level = min_level.upper()
+        self.email_sender = email_sender
 
     def emit(
         self,
@@ -44,6 +47,18 @@ class AlertManager:
         # Structured JSON line for machine parsing.
         self.logger.log(_LEVEL_ORDER.get(lvl, 20), json.dumps(body, ensure_ascii=False, default=str))
         self.store.record_event(event_type=event_type, level=lvl, msg=msg, payload=payload, trace_id=trace)
+
+        if self.email_sender is not None:
+            try:
+                self.email_sender.send(
+                    event_type=event_type,
+                    level=lvl,
+                    msg=msg,
+                    trace_id=trace,
+                    payload=payload,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("email alert send failed event=%s err=%s", event_type, exc)
 
         if _LEVEL_ORDER.get(lvl, 20) >= _LEVEL_ORDER.get(self.min_level, 20):
             if lvl in {"ERROR", "CRITICAL"}:
