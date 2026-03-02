@@ -50,6 +50,7 @@ class VLMManage(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     reduce_pct: float | None = Field(ge=0, le=100)
+    add_pct: float | None = Field(default=None, gt=0, le=200)
     move_sl_to_be: bool
     tp: list[float]
 
@@ -123,6 +124,7 @@ class VLMParsedSignal(BaseModel):
             "entry.low": self.entry.low,
             "entry.high": self.entry.high,
             "manage.reduce_pct": self.manage.reduce_pct,
+            "manage.add_pct": self.manage.add_pct,
         }
         for field_path, field_value in required_evidence_fields.items():
             if field_value is None:
@@ -151,6 +153,7 @@ class VLMParsedSignal(BaseModel):
         if self.kind == VLMKind.MANAGE_ACTION:
             has_manage = (
                 self.manage.reduce_pct is not None
+                or self.manage.add_pct is not None
                 or self.manage.move_sl_to_be
                 or len(self.manage.tp) > 0
             )
@@ -222,7 +225,12 @@ class VLMParsedSignal(BaseModel):
 
         symbol = self.symbol or fallback_symbol
         tp_price = self.manage.tp[0] if self.manage.tp else None
-        has_manage = self.manage.reduce_pct is not None or self.manage.move_sl_to_be or tp_price is not None
+        has_manage = (
+            self.manage.reduce_pct is not None
+            or self.manage.add_pct is not None
+            or self.manage.move_sl_to_be
+            or tp_price is not None
+        )
         if not has_manage:
             return NeedsManual(
                 kind=ParsedKind.NEEDS_MANUAL,
@@ -236,6 +244,7 @@ class VLMParsedSignal(BaseModel):
             raw_text=raw_text,
             symbol=symbol,
             reduce_pct=self.manage.reduce_pct,
+            add_pct=self.manage.add_pct,
             move_sl_to_be=self.manage.move_sl_to_be,
             tp_price=tp_price,
             note=self.notes or None,

@@ -22,6 +22,8 @@ class PriceFeed:
         self.bitget = bitget
         self.state = state
         self.alerts = alerts
+        self._rest_error_active = False
+        self._ws_reconnect_active = False
 
     async def run(self, stop_event: asyncio.Event) -> None:
         requested = self.config.monitor.price_feed.mode
@@ -70,9 +72,18 @@ class PriceFeed:
         while not stop_event.is_set():
             try:
                 await self.refresh_once()
+                if self._rest_error_active:
+                    self.alerts.info(
+                        "PRICE_FEED_ERROR_RECOVERED",
+                        "price feed refresh recovered",
+                        {"purpose": "price_feed", "reason": "rest_polling_recovered"},
+                    )
+                    self._rest_error_active = False
             except Exception as exc:  # noqa: BLE001
                 self.state.register_api_error()
-                self.alerts.error("PRICE_FEED_ERROR", f"price feed refresh failed: {exc}")
+                if not self._rest_error_active:
+                    self.alerts.error("PRICE_FEED_ERROR", f"price feed refresh failed: {exc}")
+                    self._rest_error_active = True
             if stop_event.is_set():
                 break
             try:
@@ -100,6 +111,13 @@ class PriceFeed:
 
             try:
                 async with websockets.connect(ws_url, ping_interval=15, ping_timeout=10, close_timeout=5) as ws:  # type: ignore[attr-defined]
+                    if self._ws_reconnect_active:
+                        self.alerts.info(
+                            "PRICE_FEED_WS_RECONNECT_RECOVERED",
+                            "ws connection recovered",
+                            {"purpose": "price_feed", "reason": "ws_reconnected"},
+                        )
+                        self._ws_reconnect_active = False
                     subs = [
                         {
                             "instType": self.config.bitget.product_type,
@@ -119,15 +137,17 @@ class PriceFeed:
             except Exception as exc:  # noqa: BLE001
                 self.state.register_api_error()
                 self.state.set_price_feed_mode(mode="rest", degraded=True)
-                self.alerts.warn(
-                    "PRICE_FEED_WS_RECONNECT",
-                    "ws connection interrupted; will reconnect",
-                    {
-                        "purpose": "price_feed",
-                        "reason": str(exc),
-                        "reconnect_seconds": self.config.monitor.price_feed.ws_reconnect_seconds,
-                    },
-                )
+                if not self._ws_reconnect_active:
+                    self.alerts.warn(
+                        "PRICE_FEED_WS_RECONNECT",
+                        "ws connection interrupted; will reconnect",
+                        {
+                            "purpose": "price_feed",
+                            "reason": str(exc),
+                            "reconnect_seconds": self.config.monitor.price_feed.ws_reconnect_seconds,
+                        },
+                    )
+                    self._ws_reconnect_active = True
                 try:
                     await asyncio.wait_for(stop_event.wait(), timeout=self.config.monitor.price_feed.ws_reconnect_seconds)
                 except TimeoutError:

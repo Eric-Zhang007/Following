@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 import uuid
 from dataclasses import dataclass
 
@@ -18,6 +19,7 @@ class StopLossResult:
     trace_id: str
     order_id: str | None = None
     client_order_id: str | None = None
+    elapsed_ms: int | None = None
 
 
 class StopLossManager:
@@ -43,6 +45,7 @@ class StopLossManager:
         source: str,
         parent_client_order_id: str | None = None,
     ) -> StopLossResult:
+        started_at = time.perf_counter()
         size = desired_size if desired_size is not None else position_state.size
         if size <= 0:
             trace = self.alerts.warn(
@@ -50,7 +53,13 @@ class StopLossManager:
                 "skip stop loss placement due to non-positive size",
                 {"symbol": position_state.symbol, "purpose": "sl", "reason": "size<=0"},
             )
-            return StopLossResult(ok=False, mode="none", reason="size<=0", trace_id=trace)
+            return StopLossResult(
+                ok=False,
+                mode="none",
+                reason="size<=0",
+                trace_id=trace,
+                elapsed_ms=self._elapsed_ms(started_at),
+            )
 
         trace = self.alerts.info(
             "SL_AUTOFIX_ATTEMPT",
@@ -82,13 +91,20 @@ class StopLossManager:
                         trace_id=trace,
                         order_id=existing.order_id,
                         client_order_id=existing.client_order_id,
+                        elapsed_ms=self._elapsed_ms(started_at),
                     )
             if not ok:
                 self._cancel_existing_sl(existing, trace, reason)
 
         trigger_price = desired_sl_price if desired_sl_price is not None else self._default_sl_price(position_state)
         if trigger_price <= 0:
-            return StopLossResult(ok=False, mode="none", reason="invalid_trigger_price", trace_id=trace)
+            return StopLossResult(
+                ok=False,
+                mode="none",
+                reason="invalid_trigger_price",
+                trace_id=trace,
+                elapsed_ms=self._elapsed_ms(started_at),
+            )
 
         sl_mode = self.config.risk.stoploss.sl_order_type
         if sl_mode in {"trigger", "plan"} and self._supports_plan_orders():
@@ -99,6 +115,7 @@ class StopLossManager:
                 source=source,
                 parent_client_order_id=parent_client_order_id,
                 trace_id=trace,
+                started_at=started_at,
             )
 
         return self._arm_local_guard(
@@ -107,6 +124,7 @@ class StopLossManager:
             size=size,
             source=source,
             trace_id=trace,
+            started_at=started_at,
         )
 
     def move_to_break_even(self, position_state: PositionState, buffer_pct: float) -> StopLossResult:
@@ -178,6 +196,18 @@ class StopLossManager:
                     "observed_price": px,
                 },
             )
+            if not self.config.execution.close_on_invariant_violation:
+                self.store.record_reconciler_action(
+                    symbol=guard.symbol,
+                    order_id=None,
+                    client_order_id=None,
+                    action="LOCAL_GUARD_TRIGGER_REPORT_ONLY",
+                    reason=guard.reason,
+                    payload={"trigger_price": guard.trigger_price, "observed_price": px, "size": guard.size},
+                    trace_id=trace,
+                )
+                self.state.deactivate_local_guard_stop(guard.symbol, guard.side)
+                continue
 
             if self.config.dry_run:
                 self.store.record_reconciler_action(
@@ -231,6 +261,7 @@ class StopLossManager:
         source: str,
         parent_client_order_id: str | None,
         trace_id: str,
+        started_at: float,
     ) -> StopLossResult:
         close_side = "sell" if position_state.side.lower() == "long" else "buy"
         reduce_only = self.config.bitget.position_mode == "one_way_mode"
@@ -274,6 +305,7 @@ class StopLossManager:
                 trace_id=trace_id,
                 order_id=sl_order.order_id,
                 client_order_id=sl_order.client_order_id,
+                elapsed_ms=self._elapsed_ms(started_at),
             )
 
         try:
@@ -329,6 +361,7 @@ class StopLossManager:
                     "reason": source,
                     "trigger_price": trigger_price,
                     "size": size,
+                    "elapsed_ms": self._elapsed_ms(started_at),
                 },
             )
             return StopLossResult(
@@ -338,6 +371,7 @@ class StopLossManager:
                 trace_id=trace_id,
                 order_id=sl_order.order_id,
                 client_order_id=sl_order.client_order_id,
+                elapsed_ms=self._elapsed_ms(started_at),
             )
         except Exception as exc:  # noqa: BLE001
             self.state.register_api_error()
@@ -359,9 +393,16 @@ class StopLossManager:
                     "reason": str(exc),
                     "trigger_price": trigger_price,
                     "size": size,
+                    "elapsed_ms": self._elapsed_ms(started_at),
                 },
             )
-            return StopLossResult(ok=False, mode="trigger", reason=str(exc), trace_id=trace_id)
+            return StopLossResult(
+                ok=False,
+                mode="trigger",
+                reason=str(exc),
+                trace_id=trace_id,
+                elapsed_ms=self._elapsed_ms(started_at),
+            )
 
     def _arm_local_guard(
         self,
@@ -371,6 +412,7 @@ class StopLossManager:
         size: float,
         source: str,
         trace_id: str,
+        started_at: float,
     ) -> StopLossResult:
         guard = LocalGuardStop(
             symbol=position_state.symbol,
@@ -410,6 +452,19 @@ class StopLossManager:
             payload={"trigger_price": trigger_price, "size": size, "purpose": "sl"},
             trace_id=trace_id,
         )
+        self.alerts.warn(
+            "SL_TRIGGER_SUBMITTED",
+            "armed local guard stop-loss",
+            {
+                "symbol": position_state.symbol,
+                "purpose": "sl",
+                "reason": source,
+                "trigger_price": trigger_price,
+                "size": size,
+                "mode": "local_guard",
+                "elapsed_ms": self._elapsed_ms(started_at),
+            },
+        )
 
         if self.state.price_feed_mode == "rest" and self.config.monitor.price_feed.rest_fallback_action_when_local_guard == "safe_mode":
             self.state.enable_safe_mode("local_guard with rest price feed")
@@ -425,6 +480,7 @@ class StopLossManager:
             reason="armed",
             trace_id=trace_id,
             client_order_id=client_oid,
+            elapsed_ms=self._elapsed_ms(started_at),
         )
 
     def _cancel_existing_sl(self, existing: OrderState, trace_id: str, reason: str) -> None:
@@ -495,3 +551,7 @@ class StopLossManager:
             except Exception:  # noqa: BLE001
                 return False
         return False
+
+    @staticmethod
+    def _elapsed_ms(started_at: float) -> int:
+        return max(0, int((time.perf_counter() - started_at) * 1000))

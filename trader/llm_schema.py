@@ -43,6 +43,7 @@ class LLMManage(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     reduce_pct: float | None = Field(default=None, ge=0, le=100)
+    add_pct: float | None = Field(default=None, gt=0, le=200)
     move_sl_to_be: bool | None = None
     tp: list[float] = Field(default_factory=list)
 
@@ -133,10 +134,11 @@ class LLMParsedOutput(BaseModel):
         # MANAGE_ACTION
         symbol = self.symbol or fallback_symbol
         reduce_pct = self.manage.reduce_pct
+        add_pct = self.manage.add_pct
         move_sl_to_be = bool(self.manage.move_sl_to_be)
         tp_price = self.manage.tp[0] if self.manage.tp else None
 
-        if reduce_pct is None and not move_sl_to_be and tp_price is None:
+        if reduce_pct is None and add_pct is None and not move_sl_to_be and tp_price is None:
             return NonSignal(
                 kind=ParsedKind.NON_SIGNAL,
                 raw_text=raw_text,
@@ -149,6 +151,7 @@ class LLMParsedOutput(BaseModel):
             raw_text=raw_text,
             symbol=symbol,
             reduce_pct=reduce_pct,
+            add_pct=add_pct,
             move_sl_to_be=move_sl_to_be,
             tp_price=tp_price,
             note=self.notes,

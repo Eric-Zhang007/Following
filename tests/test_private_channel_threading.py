@@ -21,3 +21,14 @@ def test_private_channel_threading_reply_chain(tmp_path) -> None:
     r2 = router.resolve(message_id=1003, text="继续", reply_to_msg_id=1002)
     assert r2.thread_id == 1001
     assert r2.is_root is False
+
+
+def test_private_channel_threading_detects_root_by_signal_structure(tmp_path) -> None:
+    store = SQLiteStore(str(tmp_path / "threading_structure.db"))
+    router = TradeThreadRouter(store)
+
+    msg = "#ACU（10x做多）\n進場位：市價\n盈利位：0.15—0.18—0.2\n止損位：0.0865"
+    root = router.resolve(message_id=2001, text=msg, reply_to_msg_id=None)
+
+    assert root.thread_id == 2001
+    assert root.is_root is True

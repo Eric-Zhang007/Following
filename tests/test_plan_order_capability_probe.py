@@ -58,6 +58,17 @@ def test_probe_plan_orders_capability_handles_not_found_and_network_errors() -> 
     assert state_net["reason"] == "network_error"
     assert (state_net["expires_at"] - state_net["ts"]) <= 30
 
+    client_param = BitgetClient(_bitget_config())
+
+    def fake_param(method, path, params=None, body=None, auth=False, timeout_override=None):
+        raise RuntimeError('Bitget HTTP 400: {"code":"400172","msg":"Parameter verification failed"}')
+
+    client_param._request = fake_param  # type: ignore[method-assign]
+    state_param = client_param.probe_plan_orders_capability(force=True)
+    assert state_param["supported"] is None
+    assert state_param["reason"] == "parameter_mismatch"
+    assert (state_param["expires_at"] - state_param["ts"]) <= 30
+
 
 def test_startup_probe_fallbacks_to_local_guard_and_safe_mode(tmp_path) -> None:
     cfg = AppConfig.model_validate(

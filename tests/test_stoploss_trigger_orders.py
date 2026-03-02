@@ -1,11 +1,12 @@
 import logging
+import json
 
 from trader.alerts import AlertManager
 from trader.config import AppConfig
 from trader.executor import TradeExecutor
 from trader.models import EntrySignal, EntryType, OrderAck, ParsedKind, RiskDecision, Side
 from trader.notifier import Notifier
-from trader.state import StateStore
+from trader.state import LocalGuardStop, StateStore, utc_now
 from trader.stoploss_manager import StopLossManager
 from trader.store import SQLiteStore
 
@@ -13,6 +14,7 @@ from trader.store import SQLiteStore
 class FakeBitget:
     def __init__(self) -> None:
         self.stoploss_calls = 0
+        self.close_calls = 0
 
     def supports_plan_orders(self):
         return True
@@ -23,6 +25,10 @@ class FakeBitget:
     def place_stop_loss(self, **kwargs):
         self.stoploss_calls += 1
         return OrderAck(order_id="sl-001", client_oid=kwargs.get("client_oid"), status="ACKED", raw={"ok": True})
+
+    def protective_close_position(self, symbol: str, side: str, size: float):
+        self.close_calls += 1
+        return {"ok": True, "symbol": symbol, "side": side, "size": size}
 
 
 def _config() -> AppConfig:
@@ -126,5 +132,48 @@ def test_entry_fill_places_trigger_stoploss_order(tmp_path) -> None:
 
     row = store.conn.execute(
         "SELECT action FROM reconciler_actions WHERE action='SL_TRIGGER_SUBMITTED' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert row is not None
+    event = store.conn.execute(
+        "SELECT payload_json FROM events WHERE type='SL_TRIGGER_SUBMITTED' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert event is not None
+    payload = json.loads(str(event["payload_json"]))
+    assert payload.get("elapsed_ms") is not None
+
+
+def test_local_guard_trigger_report_only_mode_does_not_close_position(tmp_path) -> None:
+    cfg = _config()
+    cfg.execution.close_on_invariant_violation = False
+    store = SQLiteStore(str(tmp_path / "guard_report_only.db"))
+    notifier = Notifier(logging.getLogger("test"))
+    alerts = AlertManager(notifier, store, logging.getLogger("test"))
+    state = StateStore()
+    bitget = FakeBitget()
+
+    manager = StopLossManager(
+        config=cfg,
+        bitget=bitget,
+        state=state,
+        store=store,
+        alerts=alerts,
+    )
+    state.register_local_guard_stop(
+        LocalGuardStop(
+            symbol="BTCUSDT",
+            side="long",
+            trigger_price=99.0,
+            size=1.0,
+            reason="test_guard",
+            created_at=utc_now(),
+        )
+    )
+    state.set_price_snapshot(symbol="BTCUSDT", mark=98.5, last=98.5, bid=98.4, ask=98.6, timestamp=utc_now())
+
+    manager.process_local_guards()
+
+    assert bitget.close_calls == 0
+    row = store.conn.execute(
+        "SELECT action FROM reconciler_actions WHERE action='LOCAL_GUARD_TRIGGER_REPORT_ONLY' ORDER BY id DESC LIMIT 1"
     ).fetchone()
     assert row is not None

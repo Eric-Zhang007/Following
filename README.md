@@ -52,19 +52,40 @@ listener:
 - `web_preview`：无需 Telegram 用户 API 凭证
 - `telegram`：需要 `telegram.api_id/api_hash`
 
-### 2) VLM
+### 2) LLM
+```yaml
+llm:
+  enabled: true
+  mode: "hybrid"               # rules_only / hybrid / llm_only
+  provider: "openai"           # openai / deepseek / qwen
+  model: "gpt-4.1-mini"        # e.g. deepseek-chat / qwen3.5-max
+  api_key_env: "OPENAI_API_KEY"  # or DEEPSEEK_API_KEY / DASHSCOPE_API_KEY
+  base_url: null               # null => provider default endpoint
+```
+
+Provider 默认 endpoint：
+- `openai`: 使用 OpenAI SDK 默认地址（或你自定义 `base_url`）
+- `deepseek`: `https://api.deepseek.com`
+- `qwen`: `https://dashscope-us.aliyuncs.com/compatible-mode/v1`
+
+### 3) VLM
 ```yaml
 vlm:
   enabled: true
-  provider: "nim"        # nim / kimi
-  model: "..."
-  api_key_env: "NIM_API_KEY"
-  base_url: "..."
+  provider: "nim"        # nim / kimi / qwen
+  model: "..."           # e.g. qwen-vl-max-latest
+  api_key_env: "NIM_API_KEY"  # or KIMI_API_KEY / DASHSCOPE_API_KEY
+  base_url: null
   confidence_threshold: 0.8
   below_threshold_action: "notify_only"
 ```
 
-### 3) 风控（严格止损）
+VLM Provider 默认 endpoint：
+- `nim`: `https://integrate.api.nvidia.com/v1`
+- `kimi`: `https://api.moonshot.cn/v1`
+- `qwen`: `https://dashscope-us.aliyuncs.com/compatible-mode/v1`
+
+### 4) 风控（严格止损）
 ```yaml
 risk:
   max_account_drawdown_pct: 0.15
@@ -80,7 +101,7 @@ risk:
   min_signal_quality: 0.8
 ```
 
-### 4) 主动监测与守护
+### 5) 主动监测与守护
 ```yaml
 monitor:
   enabled: true
@@ -96,7 +117,7 @@ monitor:
     port: 8080
 ```
 
-### 5) 计划委托能力探测
+### 6) 计划委托能力探测
 ```yaml
 bitget:
   plan_orders_probe_on_startup: true

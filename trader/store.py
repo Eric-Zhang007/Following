@@ -793,6 +793,63 @@ class SQLiteStore:
         )
         self.conn.commit()
 
+    def find_latest_thread_id_by_symbol(self, symbol: str) -> int | None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT thread_id
+            FROM trade_threads
+            WHERE symbol=?
+            ORDER BY updated_at DESC, thread_id DESC
+            LIMIT 1
+            """,
+            (symbol.upper(),),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        return int(row["thread_id"])
+
+    def get_latest_trade_thread_by_symbol(self, symbol: str, *, active_only: bool = False) -> dict[str, Any] | None:
+        cur = self.conn.cursor()
+        where = "WHERE symbol=?"
+        params: list[Any] = [symbol.upper()]
+        if active_only:
+            where += " AND status NOT IN ('REJECTED', 'REJECTED_LIMIT', 'CLOSED')"
+        cur.execute(
+            f"""
+            SELECT thread_id
+            FROM trade_threads
+            {where}
+            ORDER BY updated_at DESC, thread_id DESC
+            LIMIT 1
+            """,
+            params,
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        return self.get_trade_thread(int(row["thread_id"]))
+
+    def count_thread_actions(
+        self,
+        thread_id: int,
+        action_type: str,
+        statuses: tuple[str, ...] = ("EXECUTED", "DRY_RUN"),
+    ) -> int:
+        placeholders = ",".join(["?"] * len(statuses))
+        cur = self.conn.cursor()
+        cur.execute(
+            f"""
+            SELECT COUNT(*) AS c
+            FROM executions
+            WHERE thread_id=? AND action_type=? AND status IN ({placeholders})
+            """,
+            (thread_id, action_type, *statuses),
+        )
+        row = cur.fetchone()
+        return int(row["c"]) if row else 0
+
     def bump_trade_thread_version(self, thread_id: int) -> int:
         cur = self.conn.cursor()
         cur.execute(

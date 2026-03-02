@@ -15,8 +15,10 @@ telegram:
   api_hash: null                 # web_preview 模式下可为空
   session_name: "ivan_listener"
   channel_id: -1000000000000     # 私有频道必须填写 -100xxxxxxxxxx
+  channel_ids: []                # 可选：多频道并行监听，填写多个 -100xxxxxxxxxx
   channel_title_hint: null
   accept_only_after_startup: true
+  startup_replay_days: 0          # >0 时启动后回补最近 N 天消息（仍会做风控）
   enable_edited_events: true
   channel: "@IvanCryptotalk"
   notify_chat_id: null
@@ -27,7 +29,7 @@ bitget:
   api_secret: "YOUR_BITGET_API_SECRET"
   passphrase: "YOUR_BITGET_PASSPHRASE"
   product_type: "USDT-FUTURES"
-  margin_mode: "isolated"
+  margin_mode: "crossed"
   position_mode: "one_way_mode"
   force: "gtc"
   plan_orders_probe_on_startup: true
@@ -136,16 +138,18 @@ execution:
   require_order_ack: true
   ack_timeout_seconds: 8
   max_submit_retries: 2
+  cancel_unfilled_after_hours: 72
+  max_manage_add_times_per_thread: 2
   prefer_post_only_limit: false
   close_on_invariant_violation: true
 
 llm:
   enabled: true
   mode: "hybrid"               # rules_only / hybrid / llm_only
-  provider: "openai"
-  model: "YOUR_MODEL_NAME"
-  api_key_env: "OPENAI_API_KEY"
-  base_url: null
+  provider: "openai"           # openai / deepseek / qwen
+  model: "YOUR_MODEL_NAME"     # e.g. gpt-4.1-mini / deepseek-chat / qwen3.5-max
+  api_key_env: "OPENAI_API_KEY"  # e.g. OPENAI_API_KEY / DEEPSEEK_API_KEY / DASHSCOPE_API_KEY
+  base_url: null               # null uses provider default endpoint
   timeout_seconds: 15
   max_retries: 2
   confidence_threshold: 0.75
@@ -156,9 +160,9 @@ llm:
 
 vlm:
   enabled: true
-  provider: "nim"              # nim / kimi
-  model: "YOUR_VLM_MODEL"
-  api_key_env: "NIM_API_KEY"
+  provider: "nim"              # nim / kimi / qwen
+  model: "YOUR_VLM_MODEL"      # e.g. qwen-vl-max-latest
+  api_key_env: "NIM_API_KEY"   # e.g. NIM_API_KEY / KIMI_API_KEY / DASHSCOPE_API_KEY
   base_url: null
   timeout_seconds: 20
   max_retries: 2
@@ -174,11 +178,33 @@ alerts:
     smtp_pass_env: "SMTP_PASS"
     from_addr: "bot@example.com"
     to_addrs: ["risk@example.com"]
+    dedupe_seconds: 180           # 相同事件+相同关键信息在该窗口内只发一次
     send_on:
       - "RISK_MODE_DISABLED"
       - "CROSS_MARGIN"
       - "HIGH_LEVERAGE"
+      - "ORDER_SUBMITTED"
+      - "ORDER_FILLED"
+      - "TP_SUBMITTED"
+      - "TP_SUBMIT_FAILED"
+      - "SL_TRIGGER_SUBMITTED"
+      - "SL_TRIGGER_FAILED"
       - "STOPLOSS_PLACE_FAIL"
+      - "SL_AUTOFIX_FAILED_THEN_PANIC"
       - "PANIC_CLOSE"
+      - "PROTECTIVE_CLOSE"
+      - "PROTECTIVE_CLOSE_FAILED"
+      - "LIQUIDATION_DISTANCE_RISK"
+      - "DRAWDOWN_BREAKER"
+      - "MARGIN_USED_HIGH"
+      - "API_ERROR_BURST"
+      - "KILL_SWITCH"
+      - "UNKNOWN_POSITION"
       - "PLAN_ORDER_FALLBACK"
       - "WS_DEGRADED"
+      - "PRIVATE_MESSAGE_SKIPPED_STARTUP"
+      - "PRESTARTUP_STOPLOSS_GUARD_REJECTED"
+      - "POSITION_CLOSED_PNL_FETCH_FAIL"
+      - "POSITION_CLOSED_SUMMARY"
+      - "LOCAL_GUARD_TRIGGERED"
+      - "LOCAL_GUARD_TRIGGER_FAILED"

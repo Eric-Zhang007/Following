@@ -62,6 +62,7 @@ class ManageAction:
     reduce_pct: float | None
     move_sl_to_be: bool
     tp_price: float | None
+    add_pct: float | None = None
     tp_points: list[float] = field(default_factory=list)
     stop_loss: float | None = None
     note: str | None = None
@@ -158,6 +159,8 @@ class TelegramEvent:
     media_sha256: str | None = None
     source: str = "telegram"
     thread_id: int | None = None
+    pre_startup: bool = False
+    startup_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if self.raw_text is None:

@@ -12,12 +12,30 @@ class TelegramConfig(BaseModel):
     api_hash: str | None = None
     session_name: str = "ivan_listener"
     channel_id: int | None = None
+    channel_ids: list[int] = Field(default_factory=list)
     channel_title_hint: str | None = None
     accept_only_after_startup: bool = True
+    startup_replay_days: int = Field(default=0, ge=0, le=7)
     enable_edited_events: bool = True
     # Legacy field kept for compatibility with old telegram mode.
     channel: str = "@IvanCryptotalk"
     notify_chat_id: int | None = None
+
+    @field_validator("channel_ids")
+    @classmethod
+    def normalize_channel_ids(cls, value: list[int]) -> list[int]:
+        out: list[int] = []
+        seen: set[int] = set()
+        for raw in value:
+            try:
+                cid = int(raw)
+            except Exception:  # noqa: BLE001
+                continue
+            if cid in seen:
+                continue
+            seen.add(cid)
+            out.append(cid)
+        return out
 
 
 class ListenerConfig(BaseModel):
@@ -41,7 +59,7 @@ class BitgetConfig(BaseModel):
     api_secret: str = ""
     passphrase: str = ""
     product_type: str = "USDT-FUTURES"
-    margin_mode: Literal["isolated", "crossed"] = "isolated"
+    margin_mode: Literal["isolated", "crossed"] = "crossed"
     position_mode: Literal["one_way_mode", "hedge_mode"] = "one_way_mode"
     force: Literal["gtc", "ioc", "fok", "post_only"] = "gtc"
     plan_orders_probe_on_startup: bool = True
@@ -173,6 +191,8 @@ class ExecutionConfig(BaseModel):
     require_order_ack: bool = True
     ack_timeout_seconds: int = Field(default=8, ge=1, le=120)
     max_submit_retries: int = Field(default=2, ge=0, le=10)
+    cancel_unfilled_after_hours: int = Field(default=72, ge=0, le=720)
+    max_manage_add_times_per_thread: int = Field(default=2, ge=0, le=10)
     prefer_post_only_limit: bool = False
     close_on_invariant_violation: bool = True
 
@@ -189,7 +209,7 @@ class ExecutionConfig(BaseModel):
 class LLMConfig(BaseModel):
     enabled: bool = True
     mode: Literal["rules_only", "hybrid", "llm_only"] = "hybrid"
-    provider: Literal["openai"] = "openai"
+    provider: Literal["openai", "deepseek", "qwen"] = "openai"
     model: str = "gpt-4.1-mini"
     api_key_env: str = "OPENAI_API_KEY"
     base_url: str | None = None
@@ -207,7 +227,7 @@ class LLMConfig(BaseModel):
 
 class VLMConfig(BaseModel):
     enabled: bool = False
-    provider: Literal["nim", "kimi"] = "nim"
+    provider: Literal["nim", "kimi", "qwen"] = "nim"
     model: str = "default"
     api_key_env: str = "NIM_API_KEY"
     base_url: str | None = None
@@ -271,15 +291,40 @@ class EmailAlertConfig(BaseModel):
     smtp_pass_env: str = "SMTP_PASS"
     from_addr: str = ""
     to_addrs: list[str] = Field(default_factory=list)
+    dedupe_seconds: int = Field(default=180, ge=0, le=86400)
     send_on: list[str] = Field(
         default_factory=lambda: [
             "RISK_MODE_DISABLED",
             "CROSS_MARGIN",
             "HIGH_LEVERAGE",
+            "ORDER_SUBMITTED",
+            "ORDER_FILLED",
+            "TP_SUBMITTED",
+            "TP_SUBMIT_FAILED",
+            "SL_TRIGGER_SUBMITTED",
+            "SL_TRIGGER_FAILED",
             "STOPLOSS_PLACE_FAIL",
+            "SL_AUTOFIX_FAILED_THEN_PANIC",
             "PANIC_CLOSE",
+            "PROTECTIVE_CLOSE",
+            "PROTECTIVE_CLOSE_FAILED",
+            "LIQUIDATION_DISTANCE_RISK",
+            "DRAWDOWN_BREAKER",
+            "MARGIN_USED_HIGH",
+            "API_ERROR_BURST",
+            "KILL_SWITCH",
+            "UNKNOWN_POSITION",
             "PLAN_ORDER_FALLBACK",
             "WS_DEGRADED",
+            "PRICE_FEED_WS_FALLBACK",
+            "PRICE_FEED_LOCAL_GUARD_DEGRADED",
+            "PRICE_FEED_ERROR",
+            "PRIVATE_MESSAGE_SKIPPED_STARTUP",
+            "PRESTARTUP_STOPLOSS_GUARD_REJECTED",
+            "POSITION_CLOSED_PNL_FETCH_FAIL",
+            "POSITION_CLOSED_SUMMARY",
+            "LOCAL_GUARD_TRIGGERED",
+            "LOCAL_GUARD_TRIGGER_FAILED",
         ]
     )
 
@@ -313,8 +358,8 @@ class AppConfig(BaseModel):
                     "telegram.api_id and telegram.api_hash are required when listener.mode in {telegram, telegram_private}"
                 )
         if self.listener.mode == "telegram_private":
-            if self.telegram.channel_id is None:
-                raise ValueError("telegram.channel_id is required when listener.mode=telegram_private")
+            if self.telegram.channel_id is None and not self.telegram.channel_ids:
+                raise ValueError("telegram.channel_id or telegram.channel_ids is required when listener.mode=telegram_private")
         return self
 
 

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict
-from datetime import datetime
+import re
+from datetime import datetime, timedelta, timezone
 
 from trader.alerts import AlertManager
 from trader.bitget_client import BitgetClient
@@ -26,6 +26,7 @@ class AccountPoller:
         self.store = store
         self.alerts = alerts
         self._last_runs: dict[str, datetime] = {}
+        self._unknown_position_active: set[str] = set()
 
     async def run(self, stop_event: asyncio.Event) -> None:
         while not stop_event.is_set():
@@ -72,7 +73,9 @@ class AccountPoller:
         parsed_positions: list[PositionState] = []
 
         known_entry_symbols = self.state.known_entry_symbols()
+        old_positions = dict(self.state.positions)
         old_symbols = set(self.state.positions.keys())
+        unknown_symbols_now: set[str] = set()
 
         for row in raw_positions:
             symbol = str(row.get("symbol") or row.get("instId") or "").upper()
@@ -94,28 +97,74 @@ class AccountPoller:
                 leverage=self._to_int(row, ["leverage"]),
                 margin_mode=str(row.get("marginMode") or self.config.bitget.margin_mode),
                 timestamp=utc_now(),
-                unknown_origin=(symbol not in known_entry_symbols),
+                unknown_origin=(
+                    symbol not in known_entry_symbols
+                    and self.store.get_latest_trade_thread_by_symbol(symbol, active_only=True) is None
+                ),
                 opened_at=utc_now(),
             )
             parsed_positions.append(position)
 
             if position.unknown_origin:
+                unknown_symbols_now.add(symbol)
                 self.state.enable_safe_mode(f"unknown position detected on exchange: {symbol}")
-                self.alerts.warn(
-                    "UNKNOWN_POSITION",
-                    "exchange reports unknown position; blocking new entries",
-                    {"symbol": symbol, "size": size, "side": side},
-                )
+                if symbol not in self._unknown_position_active:
+                    self.alerts.warn(
+                        "UNKNOWN_POSITION",
+                        "exchange reports unknown position; blocking new entries",
+                        {"symbol": symbol, "size": size, "side": side},
+                    )
+                    self._unknown_position_active.add(symbol)
 
         self.state.set_positions(parsed_positions)
+        recovered_unknown = self._unknown_position_active - unknown_symbols_now
+        if recovered_unknown:
+            for symbol in recovered_unknown:
+                self._unknown_position_active.discard(symbol)
+                self.alerts.info(
+                    "UNKNOWN_POSITION_RECOVERED",
+                    "unknown position state recovered",
+                    {"symbol": symbol},
+                )
+
         new_symbols = {p.symbol for p in parsed_positions}
         cleared = old_symbols - new_symbols
         for symbol in cleared:
             self.state.clear_orders_for_symbol(symbol)
+            prev = old_positions.get(symbol)
+            thread_id = self.store.find_latest_thread_id_by_symbol(symbol)
+            if thread_id is not None:
+                self.store.set_trade_thread_status(thread_id, "CLOSED")
+
+            account = self.state.account
+            realized_pnl, pnl_source = await self._resolve_realized_pnl(symbol=symbol, side=(prev.side if prev else None))
+            payload = {
+                "symbol": symbol,
+                "thread_id": thread_id,
+                "position_side": prev.side if prev is not None else None,
+                "position_size": prev.size if prev is not None else None,
+                "entry_price": prev.entry_price if prev is not None else None,
+                "last_mark_price": prev.mark_price if prev is not None else None,
+                "realized_pnl": realized_pnl,
+                "pnl_source": pnl_source,
+                "account_equity": account.equity if account is not None else None,
+                "account_available": account.available if account is not None else None,
+                "account_margin_used": account.margin_used if account is not None else None,
+            }
+            if thread_id is not None:
+                payload["entry_times"] = self.store.count_thread_actions(thread_id, "ENTRY")
+                payload["add_times"] = self.store.count_thread_actions(thread_id, "MANAGE_ADD")
+                payload["reduce_times"] = self.store.count_thread_actions(thread_id, "MANAGE_REDUCE")
+
             self.alerts.info(
                 "POSITION_CLEARED",
                 "position no longer exists on exchange; cleared local order state",
                 {"symbol": symbol},
+            )
+            self.alerts.info(
+                "POSITION_CLOSED_SUMMARY",
+                "position closed summary",
+                payload,
             )
 
     async def poll_open_orders(self) -> None:
@@ -133,7 +182,16 @@ class AccountPoller:
             if not symbol:
                 continue
             side = str(row.get("side") or "").lower() or "buy"
-            purpose = self._infer_purpose(row)
+            client_oid = str(row.get("clientOid") or "") or None
+            order_id = str(row.get("orderId") or "") or None
+            existing = self.state.find_order(client_order_id=client_oid, order_id=order_id)
+
+            purpose = self._resolve_order_purpose(row, existing)
+            thread_id, entry_index = self._resolve_order_thread_context(
+                symbol=symbol,
+                client_order_id=client_oid,
+                existing=existing,
+            )
             state = OrderState(
                 symbol=symbol,
                 side=side,
@@ -145,10 +203,13 @@ class AccountPoller:
                 trade_side=str(row.get("tradeSide") or "").lower() or None,
                 purpose=purpose,
                 timestamp=now,
-                client_order_id=str(row.get("clientOid") or "") or None,
-                order_id=str(row.get("orderId") or "") or None,
+                client_order_id=client_oid,
+                order_id=order_id,
                 trigger_price=self._to_float(row, ["triggerPrice", "triggerPx"]),
                 is_plan_order=bool(row.get("planType") or row.get("triggerType")),
+                parent_client_order_id=existing.parent_client_order_id if existing is not None else None,
+                thread_id=thread_id,
+                entry_index=entry_index,
             )
             self.state.upsert_order(state)
 
@@ -166,16 +227,70 @@ class AccountPoller:
 
     @staticmethod
     def _infer_purpose(row: dict) -> str:
+        client_oid = str(row.get("clientOid") or "").lower()
+        if client_oid.startswith("tp-") or "-tp-" in client_oid:
+            return "tp"
+        if client_oid.startswith("sl-") or "-sl-" in client_oid:
+            return "sl"
         plan_type = str(row.get("planType") or "").lower()
         if "profit" in plan_type:
             return "tp"
         if "loss" in plan_type:
             return "sl"
+        if plan_type == "normal_plan":
+            # Some accounts return TP/SL as normal_plan; infer from preset fields when available.
+            has_tp_fields = any(
+                row.get(key) not in {None, ""}
+                for key in ("stopSurplusTriggerPrice", "stopSurplusExecutePrice", "presetTakeProfitPrice")
+            )
+            has_sl_fields = any(
+                row.get(key) not in {None, ""}
+                for key in ("stopLossTriggerPrice", "stopLossExecutePrice", "presetStopLossPrice")
+            )
+            if has_tp_fields and not has_sl_fields:
+                return "tp"
+            if has_sl_fields and not has_tp_fields:
+                return "sl"
         trade_side = str(row.get("tradeSide") or "").lower()
         reduce_only = str(row.get("reduceOnly", "NO")).upper() == "YES"
         if reduce_only or trade_side == "close":
             return "sl"
         return "entry"
+
+    def _resolve_order_purpose(self, row: dict, existing: OrderState | None) -> str:
+        if existing is not None and existing.purpose:
+            return existing.purpose
+        return self._infer_purpose(row)
+
+    def _resolve_order_thread_context(
+        self,
+        *,
+        symbol: str,
+        client_order_id: str | None,
+        existing: OrderState | None,
+    ) -> tuple[int | None, int | None]:
+        if existing is not None and existing.thread_id is not None:
+            return existing.thread_id, existing.entry_index
+
+        parsed_thread, parsed_entry = self._parse_entry_thread(client_order_id)
+        if parsed_thread is not None:
+            return parsed_thread, parsed_entry
+
+        latest = self.store.get_latest_trade_thread_by_symbol(symbol, active_only=True)
+        return (int(latest["thread_id"]), None) if latest is not None else (None, None)
+
+    @staticmethod
+    def _parse_entry_thread(client_order_id: str | None) -> tuple[int | None, int | None]:
+        if not client_order_id:
+            return None, None
+        # Preferred format: entry-{thread_id}-{entry_index}-{suffix}
+        match = re.match(r"^entry-(\d+)-(\d+)-", client_order_id)
+        if not match:
+            return None, None
+        try:
+            return int(match.group(1)), int(match.group(2))
+        except Exception:  # noqa: BLE001
+            return None, None
 
     @staticmethod
     def _extract_position_side(row: dict) -> str:
@@ -204,6 +319,90 @@ class AccountPoller:
                 except Exception:  # noqa: BLE001
                     continue
         return None
+
+    async def _resolve_realized_pnl(self, *, symbol: str, side: str | None) -> tuple[float | None, str]:
+        if not hasattr(self.bitget, "get_history_positions"):
+            return None, "history_position.unsupported"
+
+        now = utc_now()
+        start = now - timedelta(days=7)
+        try:
+            rows = await asyncio.to_thread(
+                self.bitget.get_history_positions,
+                symbol=symbol,
+                start_time=start,
+                end_time=now,
+                limit=50,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.state.register_api_error()
+            self.alerts.warn(
+                "POSITION_CLOSED_PNL_FETCH_FAIL",
+                "failed to query realized pnl for closed position",
+                {"symbol": symbol, "error": str(exc)},
+            )
+            return None, "history_position.error"
+
+        row = self._pick_latest_history_position(rows, symbol=symbol, side=side)
+        if row is None:
+            return None, "history_position.not_found"
+        pnl_value, pnl_key = self._extract_realized_pnl_from_row(row)
+        if pnl_value is None:
+            return None, "history_position.pnl_missing"
+        return pnl_value, f"history_position.{pnl_key}"
+
+    @classmethod
+    def _pick_latest_history_position(
+        cls,
+        rows: list[dict],
+        *,
+        symbol: str,
+        side: str | None,
+    ) -> dict | None:
+        symbol_upper = symbol.upper()
+        side_lower = (side or "").lower()
+        candidates: list[tuple[float, dict]] = []
+        for row in rows:
+            row_symbol = str(row.get("symbol") or row.get("instId") or "").upper()
+            if row_symbol and row_symbol != symbol_upper:
+                continue
+            row_side = cls._extract_history_position_side(row)
+            if side_lower and row_side and row_side != side_lower:
+                continue
+            ts = cls._extract_history_position_ts(row)
+            candidates.append((ts, row))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return candidates[0][1]
+
+    @staticmethod
+    def _extract_history_position_side(row: dict) -> str | None:
+        for key in ("holdSide", "posSide", "positionSide"):
+            value = str(row.get(key) or "").lower()
+            if value in {"long", "short"}:
+                return value
+        return None
+
+    @staticmethod
+    def _extract_history_position_ts(row: dict) -> float:
+        for key in ("uTime", "utime", "closeTime", "cTime", "ctime"):
+            raw = row.get(key)
+            if raw in (None, ""):
+                continue
+            try:
+                return float(raw)
+            except Exception:  # noqa: BLE001
+                continue
+        return datetime.now(timezone.utc).timestamp() * 1000
+
+    @classmethod
+    def _extract_realized_pnl_from_row(cls, row: dict) -> tuple[float | None, str | None]:
+        for key in ("netProfit", "realizedPL", "achievedProfits", "pnl", "profit"):
+            value = cls._to_float(row, [key])
+            if value is not None:
+                return value, key
+        return None, None
 
     def _due(self, key: str, interval_seconds: int, now: datetime) -> bool:
         last = self._last_runs.get(key)

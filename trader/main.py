@@ -16,6 +16,7 @@ from trader.alerts import AlertManager
 from trader.bitget_client import BitgetClient
 from trader.config import AppConfig, load_config
 from trader.email_alert import SMTPAlertSender
+from trader.entry_fallback import convert_market_to_limit_signal, is_market_slippage_reject
 from trader.executor import TradeExecutor
 from trader.health_server import HealthServer
 from trader.kill_switch import KillSwitch
@@ -130,6 +131,7 @@ async def _run_async(config_path: Path) -> None:
         symbol_registry=symbol_registry,
         runtime_state=runtime_state,
         stoploss_manager=stoploss_manager,
+        alerts=alerts,
     )
 
     stop_event = asyncio.Event()
@@ -148,6 +150,7 @@ async def _run_async(config_path: Path) -> None:
             store=store,
             alerts=alerts,
             stoploss_manager=stoploss_manager,
+            symbol_registry=symbol_registry,
         )
         kill_switch = KillSwitch(store=store)
         risk_daemon = RiskDaemon(
@@ -158,6 +161,7 @@ async def _run_async(config_path: Path) -> None:
             alerts=alerts,
             kill_switch=kill_switch,
             stoploss_manager=stoploss_manager,
+            symbol_registry=symbol_registry,
         )
         health_server = HealthServer(config=config, state=runtime_state)
 
@@ -195,6 +199,7 @@ async def _run_async(config_path: Path) -> None:
                 store=store,
                 parser=private_parser,
                 thread_router=thread_router,
+                bitget=bitget,
                 risk_manager=risk_manager,
                 executor=executor,
                 notifier=notifier,
@@ -441,7 +446,34 @@ async def _run_async(config_path: Path) -> None:
     else:
         listener = TelegramListener(config.telegram, logger)
 
-    listener_task = asyncio.create_task(listener.run(on_event), name="listener")
+    async def on_private_ignored(payload: dict[str, Any]) -> None:
+        chat_id = int(payload.get("channel_id", 0) or 0)
+        message_id = int(payload.get("message_id", 0) or 0)
+        store.record_execution(
+            chat_id=chat_id,
+            message_id=message_id,
+            version=1,
+            action_type="SYSTEM",
+            purpose="ENTRY",
+            symbol=None,
+            side=None,
+            status="REJECTED",
+            reason="ignored_before_startup",
+            intent=payload,
+        )
+        alerts.warn(
+            "PRIVATE_MESSAGE_SKIPPED_STARTUP",
+            "private channel message ignored because it is older than startup time",
+            payload,
+        )
+
+    if config.listener.mode == "telegram_private":
+        listener_task = asyncio.create_task(
+            listener.run(on_event, on_ignored=on_private_ignored),  # type: ignore[call-arg]
+            name="listener",
+        )
+    else:
+        listener_task = asyncio.create_task(listener.run(on_event), name="listener")
     stop_wait_task = asyncio.create_task(stop_event.wait(), name="stop_wait")
 
     try:
@@ -549,6 +581,35 @@ async def _handle_entry(
         signal_quality=signal_quality,
     )
 
+    if not decision.approved and is_market_slippage_reject(decision.reason):
+        limit_signal = convert_market_to_limit_signal(parsed)
+        if limit_signal is not None:
+            limit_decision = risk_manager.evaluate_entry(
+                signal=limit_signal,
+                current_price=current_price,
+                account_equity=account_equity,
+                now=now.astimezone(timezone.utc),
+                within_cooldown=within_cooldown,
+                open_positions_count=open_positions_count,
+                signal_quality=signal_quality,
+            )
+            if limit_decision.approved:
+                store.record_event(
+                    event_type="ENTRY_MARKET_FALLBACK_LIMIT",
+                    level="WARN",
+                    msg="market entry rejected by slippage; fallback to limit entry",
+                    payload={
+                        "symbol": parsed.symbol,
+                        "side": parsed.side.value,
+                        "reason": decision.reason,
+                        "entry_points": limit_signal.entry_points,
+                        "current_price": current_price,
+                    },
+                )
+                notifier.warning("ENTRY market slippage fallback: converted to limit entry")
+                parsed = limit_signal
+                decision = limit_decision
+
     if not decision.approved:
         store.record_execution(
             chat_id,
@@ -576,6 +637,7 @@ async def _handle_private_event(
     store: SQLiteStore,
     parser: PrivateChannelParser,
     thread_router: TradeThreadRouter,
+    bitget: BitgetClient,
     risk_manager: RiskManager,
     executor: TradeExecutor,
     notifier: Notifier,
@@ -591,7 +653,16 @@ async def _handle_private_event(
         is_edit=event.is_edit,
         event_time=event.date,
     )
-    if message_state.duplicate and not event.is_edit:
+    if message_state.duplicate:
+        if event.is_edit:
+            store.record_event(
+                event_type="THREAD_EDIT_DUPLICATE_IGNORED",
+                level="INFO",
+                msg="edit ignored because text hash unchanged",
+                payload={"message_id": event.message_id, "thread_id": event.thread_id},
+                reason="duplicate_edit",
+                thread_id=event.thread_id,
+            )
         return
 
     thread_result = thread_router.resolve(
@@ -600,14 +671,39 @@ async def _handle_private_event(
         reply_to_msg_id=event.reply_to_msg_id,
     )
     if thread_result.thread_id is None:
-        store.record_event(
-            event_type="THREAD_MESSAGE_IGNORED",
-            level="INFO",
-            msg="message ignored because no trade thread mapping",
-            payload={"message_id": event.message_id, "reply_to_msg_id": event.reply_to_msg_id},
-            reason=thread_result.reason,
+        # Fallback parse for non-thread messages to reduce missed root signals.
+        fallback_outcome = parser.parse(
+            text=text,
+            timestamp=event.date,
+            image_path=event.media_path,
+            fallback_symbol=store.get_last_entry_symbol(event.chat_id),
+            thread_id=event.message_id,
+            is_root=True,
+            prefer_llm_fallback=True,
         )
-        return
+        if isinstance(fallback_outcome.parsed, (EntrySignal, ManageAction)):
+            store.record_event(
+                event_type="THREAD_MESSAGE_FALLBACK_PARSED",
+                level="INFO",
+                msg="non-thread message accepted by fallback parser",
+                payload={
+                    "message_id": event.message_id,
+                    "parse_source": fallback_outcome.parse_source,
+                    "confidence": fallback_outcome.confidence,
+                },
+                reason=thread_result.reason,
+            )
+            thread_id = event.message_id
+            thread_result = type(thread_result)(thread_id=thread_id, is_root=True, reason="fallback_root_parsed")
+        else:
+            store.record_event(
+                event_type="THREAD_MESSAGE_IGNORED",
+                level="INFO",
+                msg="message ignored because no trade thread mapping",
+                payload={"message_id": event.message_id, "reply_to_msg_id": event.reply_to_msg_id},
+                reason=thread_result.reason,
+            )
+            return
 
     thread_id = thread_result.thread_id
     event.thread_id = thread_id
@@ -740,7 +836,7 @@ async def _handle_private_event(
             stop_loss=parsed.stop_loss,
             entry_points=parsed.entry_points,
             tp_points=parsed.tp_points or parsed.take_profit,
-            status="ACTIVE",
+            status="PENDING_ENTRY",
         )
         _emit_once_per_thread_alert(
             store=store,
@@ -779,6 +875,7 @@ async def _handle_private_event(
                 thread_id=thread_id,
                 purpose="entry",
             )
+            store.set_trade_thread_status(thread_id, "REJECTED")
             return
 
         if event.is_edit and thread_result.is_root:
@@ -814,7 +911,166 @@ async def _handle_private_event(
                 thread_id=thread_id,
                 purpose="entry",
             )
+            store.set_trade_thread_status(thread_id, "RECORDED")
             return
+
+        now = utc_now()
+        current_price = parsed.entry_high
+        try:
+            current_price = bitget.get_ticker_price(parsed.symbol)
+        except Exception as exc:  # noqa: BLE001
+            store.record_execution(
+                event.chat_id,
+                event.message_id,
+                message_state.version,
+                action_type="ENTRY",
+                symbol=parsed.symbol,
+                side=parsed.side.value,
+                status="REJECTED",
+                reason=f"ticker unavailable: {exc}",
+                intent=_to_dict(parsed),
+                thread_id=thread_id,
+                purpose="entry",
+            )
+            notifier.warning(f"ENTRY rejected: ticker unavailable for {parsed.symbol}")
+            runtime_state.register_api_error()
+            store.set_trade_thread_status(thread_id, "REJECTED")
+            return
+
+        startup_guard_reason = _prestartup_stoploss_guard_reason(
+            config=config,
+            bitget=bitget,
+            signal=parsed,
+            event=event,
+        )
+        if startup_guard_reason:
+            store.record_execution(
+                chat_id=event.chat_id,
+                message_id=event.message_id,
+                version=message_state.version,
+                action_type="ENTRY",
+                symbol=parsed.symbol,
+                side=parsed.side.value,
+                status="REJECTED",
+                reason=startup_guard_reason,
+                intent=_to_dict(parsed),
+                thread_id=thread_id,
+                purpose="entry",
+            )
+            alerts.warn(
+                "PRESTARTUP_STOPLOSS_GUARD_REJECTED",
+                "startup replay entry rejected by stop-loss history guard",
+                {
+                    "thread_id": thread_id,
+                    "symbol": parsed.symbol,
+                    "side": parsed.side.value,
+                    "reason": startup_guard_reason,
+                    "message_id": event.message_id,
+                },
+            )
+            notifier.warning(f"ENTRY rejected: {startup_guard_reason}")
+            store.set_trade_thread_status(thread_id, "REJECTED")
+            return
+
+        if runtime_state.account is not None:
+            account_equity = runtime_state.account.equity
+            open_positions_count = len(runtime_state.positions)
+        elif config.dry_run:
+            account_equity = config.risk.assumed_equity_usdt
+            open_positions_count = 0
+        else:
+            try:
+                account_equity = bitget.get_account_equity()
+            except Exception as exc:  # noqa: BLE001
+                store.record_execution(
+                    event.chat_id,
+                    event.message_id,
+                    message_state.version,
+                    action_type="ENTRY",
+                    symbol=parsed.symbol,
+                    side=parsed.side.value,
+                    status="REJECTED",
+                    reason=f"equity unavailable: {exc}",
+                    intent=_to_dict(parsed),
+                    thread_id=thread_id,
+                    purpose="entry",
+                )
+                notifier.warning(f"ENTRY rejected: equity unavailable for {parsed.symbol}")
+                runtime_state.register_api_error()
+                store.set_trade_thread_status(thread_id, "REJECTED")
+                return
+            try:
+                open_positions_count = bitget.get_open_positions_count()
+            except Exception:  # noqa: BLE001
+                open_positions_count = 0
+
+        within_cooldown = store.within_cooldown(
+            parsed.symbol,
+            parsed.side.value,
+            config.risk.cooldown_seconds,
+            now=now,
+        )
+        decision = risk_manager.evaluate_entry(
+            signal=parsed,
+            current_price=current_price,
+            account_equity=account_equity,
+            now=now.astimezone(timezone.utc),
+            within_cooldown=within_cooldown,
+            open_positions_count=open_positions_count,
+            signal_quality=float(parse_outcome.confidence),
+            ignore_signal_age=event.pre_startup,
+        )
+        if not decision.approved and is_market_slippage_reject(decision.reason):
+            limit_signal = convert_market_to_limit_signal(parsed)
+            if limit_signal is not None:
+                limit_decision = risk_manager.evaluate_entry(
+                    signal=limit_signal,
+                    current_price=current_price,
+                    account_equity=account_equity,
+                    now=now.astimezone(timezone.utc),
+                    within_cooldown=within_cooldown,
+                    open_positions_count=open_positions_count,
+                    signal_quality=float(parse_outcome.confidence),
+                    ignore_signal_age=event.pre_startup,
+                )
+                if limit_decision.approved:
+                    store.record_event(
+                        event_type="ENTRY_MARKET_FALLBACK_LIMIT",
+                        level="WARN",
+                        msg="market entry rejected by slippage; fallback to limit entry",
+                        payload={
+                            "thread_id": thread_id,
+                            "symbol": parsed.symbol,
+                            "side": parsed.side.value,
+                            "reason": decision.reason,
+                            "entry_points": limit_signal.entry_points,
+                            "current_price": current_price,
+                        },
+                        reason="market_slippage_auto_limit",
+                        thread_id=thread_id,
+                    )
+                    notifier.warning("ENTRY market slippage fallback: converted to limit entry")
+                    parsed = limit_signal
+                    decision = limit_decision
+        if not decision.approved:
+            store.record_execution(
+                chat_id=event.chat_id,
+                message_id=event.message_id,
+                version=message_state.version,
+                action_type="ENTRY",
+                symbol=parsed.symbol,
+                side=parsed.side.value,
+                status="REJECTED",
+                reason=decision.reason,
+                intent=_to_dict(parsed),
+                thread_id=thread_id,
+                purpose="entry",
+            )
+            notifier.warning(f"ENTRY rejected: {decision.reason}")
+            store.set_trade_thread_status(thread_id, "REJECTED")
+            return
+        for warning in decision.warnings:
+            notifier.warning(warning)
 
         result = executor.execute_thread_entry(
             parsed,
@@ -822,6 +1078,7 @@ async def _handle_private_event(
             message_id=event.message_id,
             version=message_state.version,
             thread_id=thread_id,
+            risk_decision=decision,
         )
         if result.get("placed", 0) > 0:
             store.set_trade_thread_status(thread_id, "ACTIVE")
@@ -858,6 +1115,81 @@ async def _handle_private_event(
             message_state.version,
             thread_id=thread_id,
         )
+
+
+def _prestartup_stoploss_guard_reason(
+    *,
+    config: AppConfig,
+    bitget: BitgetClient,
+    signal: EntrySignal,
+    event: TelegramEvent,
+) -> str | None:
+    if not event.pre_startup or event.startup_at is None:
+        return None
+
+    signal_time = signal.timestamp or event.date
+    if signal_time.tzinfo is None:
+        signal_time = signal_time.replace(tzinfo=timezone.utc)
+    startup_at = event.startup_at
+    if startup_at.tzinfo is None:
+        startup_at = startup_at.replace(tzinfo=timezone.utc)
+    if signal_time >= startup_at:
+        return None
+
+    stop_loss_price = _resolve_entry_stop_loss_price(signal, config)
+    if stop_loss_price is None or stop_loss_price <= 0:
+        return "prestartup_guard_stop_loss_unavailable"
+
+    try:
+        touched = bitget.was_stop_loss_touched(
+            symbol=signal.symbol,
+            side=signal.side.value,
+            stop_loss=stop_loss_price,
+            start_time=signal_time,
+            end_time=startup_at,
+            granularity="1m",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return f"prestartup_guard_history_unavailable: {exc}"
+
+    if touched:
+        return f"prestartup_stop_loss_touched:{stop_loss_price:.8f}"
+    return None
+
+
+def _resolve_entry_stop_loss_price(signal: EntrySignal, config: AppConfig) -> float | None:
+    if signal.stop_loss is not None:
+        return float(signal.stop_loss)
+    entry_price = _pick_entry_price_for_guard(signal, config)
+    if entry_price <= 0:
+        return None
+    ratio = _ratio_from_percent_or_ratio(config.risk.default_stop_loss_pct)
+    if ratio <= 0:
+        return None
+    if signal.side.value == "LONG":
+        return entry_price * (1 - ratio)
+    return entry_price * (1 + ratio)
+
+
+def _pick_entry_price_for_guard(signal: EntrySignal, config: AppConfig) -> float:
+    if signal.entry_type.value == "MARKET":
+        return signal.entry_high
+    strategy = config.execution.limit_price_strategy
+    if strategy == "LOW":
+        return signal.entry_low
+    if strategy == "HIGH":
+        return signal.entry_high
+    return (signal.entry_low + signal.entry_high) / 2
+
+
+def _ratio_from_percent_or_ratio(value: float) -> float:
+    if value <= 0:
+        return 0.0
+    if value >= 1:
+        return value / 100.0
+    if value > 0.05:
+        return value / 100.0
+    return value
 
 
 def _emit_once_per_thread_alert(

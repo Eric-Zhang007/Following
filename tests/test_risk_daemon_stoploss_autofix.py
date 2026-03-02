@@ -14,11 +14,13 @@ from trader.store import SQLiteStore
 class FakeBitgetFailSL:
     def __init__(self) -> None:
         self.close_calls = 0
+        self.stoploss_calls = 0
 
     def supports_plan_orders(self):
         return True
 
     def place_stop_loss(self, **kwargs):
+        self.stoploss_calls += 1
         raise RuntimeError("sl place failed")
 
     def protective_close_position(self, symbol: str, side: str, size: float):
@@ -113,3 +115,49 @@ def test_sl_autofix_fail_triggers_protective_close_and_safe_mode(tmp_path) -> No
     ).fetchone()
     assert row is not None
     assert row["reason"] == "sl_autofix_failed_then_panic"
+
+
+def test_sl_autofix_report_only_mode_skips_auto_close_and_autofix(tmp_path) -> None:
+    cfg = _config()
+    cfg.execution.close_on_invariant_violation = False
+
+    store = SQLiteStore(str(tmp_path / "daemon_report_only.db"))
+    alerts = AlertManager(Notifier(logging.getLogger("test")), store, logging.getLogger("test"))
+    state = StateStore()
+    state.set_account(equity=1000, available=900, margin_used=100)
+    state.set_positions(
+        [
+            PositionState(
+                symbol="BTCUSDT",
+                side="long",
+                size=1.0,
+                entry_price=100,
+                mark_price=100,
+                liq_price=50,
+                pnl=0,
+                leverage=5,
+                margin_mode="isolated",
+                timestamp=utc_now(),
+                opened_at=utc_now() - timedelta(seconds=20),
+            )
+        ]
+    )
+
+    bitget = FakeBitgetFailSL()
+    daemon = RiskDaemon(
+        config=cfg,
+        bitget=bitget,
+        state=state,
+        store=store,
+        alerts=alerts,
+        kill_switch=KillSwitch(store=store, file_path=str(tmp_path / "NO_SWITCH")),
+    )
+
+    asyncio.run(daemon.tick_once())
+
+    assert bitget.stoploss_calls == 0
+    assert bitget.close_calls == 0
+    event = store.conn.execute(
+        "SELECT type FROM events WHERE type='SL_MISSING' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert event is not None

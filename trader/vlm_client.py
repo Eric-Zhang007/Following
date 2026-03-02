@@ -37,12 +37,7 @@ class VLMClient:
         if not self.api_key:
             raise RuntimeError(f"missing API key in env var: {config.api_key_env}")
 
-        if config.base_url:
-            self.base_url = config.base_url.rstrip("/")
-        elif config.provider == "nim":
-            self.base_url = "https://integrate.api.nvidia.com/v1"
-        else:
-            self.base_url = "https://api.moonshot.cn/v1"
+        self.base_url = _resolve_base_url(config.provider, config.base_url)
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -106,4 +101,40 @@ class VLMClient:
             raw_text = str(content or "").strip()
         if not raw_text:
             raise RuntimeError(f"VLM response missing content: {response_payload}")
-        return json.loads(raw_text)
+        return _parse_json_text(raw_text)
+
+
+def _resolve_base_url(provider: str, configured: str | None) -> str:
+    if configured:
+        return configured.rstrip("/")
+    p = str(provider).strip().lower()
+    if p == "nim":
+        return "https://integrate.api.nvidia.com/v1"
+    if p == "kimi":
+        return "https://api.moonshot.cn/v1"
+    if p == "qwen":
+        return "https://dashscope-us.aliyuncs.com/compatible-mode/v1"
+    raise RuntimeError(f"unsupported VLM provider: {provider}")
+
+
+def _parse_json_text(raw: str) -> dict[str, Any]:
+    text = str(raw).strip()
+    if not text:
+        raise RuntimeError("empty JSON text")
+    try:
+        return json.loads(text)
+    except Exception:  # noqa: BLE001
+        pass
+
+    if text.startswith("```") and text.endswith("```"):
+        lines = text.splitlines()
+        if len(lines) >= 3:
+            inner = "\n".join(lines[1:-1]).strip()
+            if inner:
+                return json.loads(inner)
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        return json.loads(text[start : end + 1])
+    raise RuntimeError(f"invalid JSON text: {text[:200]}")

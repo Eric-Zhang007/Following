@@ -3,7 +3,7 @@ import logging
 
 from trader.config import AppConfig
 from trader.executor import TradeExecutor
-from trader.models import EntrySignal, EntryType, ParsedKind, Side
+from trader.models import EntrySignal, EntryType, ParsedKind, RiskDecision, Side
 from trader.notifier import Notifier
 from trader.state import StateStore
 from trader.store import SQLiteStore
@@ -104,3 +104,181 @@ def test_two_entry_split_ratio_keeps_post_order(tmp_path) -> None:
     assert i0["quantity"] < i1["quantity"]
     assert i0["price"] == 10.0
     assert i1["price"] == 8.0
+
+
+def test_major_or_high_leverage_prefers_even_split(tmp_path) -> None:
+    store = SQLiteStore(str(tmp_path / "split_major.db"))
+    state = StateStore()
+    contract = ContractInfo(symbol="BTCUSDT", size_place=6, price_place=2, min_trade_num=0.0, raw={})
+    executor = TradeExecutor(
+        config=_config(),
+        bitget=_FakeBitget(),  # type: ignore[arg-type]
+        store=store,
+        notifier=Notifier(logging.getLogger("test")),
+        logger=logging.getLogger("test"),
+        symbol_registry=_FakeRegistry(contract),  # type: ignore[arg-type]
+        runtime_state=state,
+    )
+    signal = EntrySignal(
+        kind=ParsedKind.ENTRY_SIGNAL,
+        raw_text="交易信號",
+        symbol="BTCUSDT",
+        quote="USDT",
+        side=Side.LONG,
+        leverage=60,
+        entry_type=EntryType.LIMIT,
+        entry_low=60000.0,
+        entry_high=62000.0,
+        entry_points=[62000.0, 60000.0],
+        stop_loss=59000.0,
+        tp_points=[64000.0, 66000.0],
+    )
+    result = executor.execute_thread_entry(signal, chat_id=1, message_id=22, version=1, thread_id=9002)
+    assert result["placed"] == 2
+
+    rows = store.conn.execute(
+        "SELECT intent_json FROM executions WHERE thread_id=9002 AND purpose='entry' ORDER BY id ASC"
+    ).fetchall()
+    assert len(rows) == 2
+    i0 = json.loads(rows[0]["intent_json"])
+    i1 = json.loads(rows[1]["intent_json"])
+
+    q0 = float(i0["quantity"])
+    q1 = float(i1["quantity"])
+    assert q0 > 0
+    assert q1 > 0
+    # High leverage path should use an even split (allow tiny rounding diff).
+    assert abs(q0 - q1) / max(q0, q1) < 0.03
+
+
+def test_thread_entry_respects_risk_notional_cap(tmp_path) -> None:
+    store = SQLiteStore(str(tmp_path / "split_cap.db"))
+    state = StateStore()
+    contract = ContractInfo(symbol="BTCUSDT", size_place=6, price_place=2, min_trade_num=0.0, raw={})
+    executor = TradeExecutor(
+        config=_config(),
+        bitget=_FakeBitget(),  # type: ignore[arg-type]
+        store=store,
+        notifier=Notifier(logging.getLogger("test")),
+        logger=logging.getLogger("test"),
+        symbol_registry=_FakeRegistry(contract),  # type: ignore[arg-type]
+        runtime_state=state,
+    )
+    signal = EntrySignal(
+        kind=ParsedKind.ENTRY_SIGNAL,
+        raw_text="交易信號",
+        symbol="BTCUSDT",
+        quote="USDT",
+        side=Side.LONG,
+        leverage=50,
+        entry_type=EntryType.LIMIT,
+        entry_low=60000.0,
+        entry_high=62000.0,
+        entry_points=[62000.0, 60000.0],
+        stop_loss=59000.0,
+        tp_points=[64000.0, 66000.0],
+    )
+    # per_trade_margin_usdt=30 and leverage=50 would imply notional=1500,
+    # but risk cap below should clamp to 300.
+    decision = RiskDecision(approved=True, notional=300.0)
+    result = executor.execute_thread_entry(
+        signal,
+        chat_id=1,
+        message_id=33,
+        version=1,
+        thread_id=9003,
+        risk_decision=decision,
+    )
+    assert result["placed"] == 2
+    rows = store.conn.execute(
+        "SELECT intent_json FROM executions WHERE thread_id=9003 AND purpose='entry' ORDER BY id ASC"
+    ).fetchall()
+    assert len(rows) == 2
+    i0 = json.loads(rows[0]["intent_json"])
+    i1 = json.loads(rows[1]["intent_json"])
+    total_notional = float(i0["quantity"]) * float(i0["price"]) + float(i1["quantity"]) * float(i1["price"])
+    assert total_notional < 350.0
+
+
+def test_market_entry_without_numeric_range_uses_risk_anchor(tmp_path) -> None:
+    store = SQLiteStore(str(tmp_path / "split_market_anchor.db"))
+    state = StateStore()
+    contract = ContractInfo(symbol="INXUSDT", size_place=6, price_place=6, min_trade_num=0.0, raw={})
+    executor = TradeExecutor(
+        config=_config(),
+        bitget=_FakeBitget(),  # type: ignore[arg-type]
+        store=store,
+        notifier=Notifier(logging.getLogger("test")),
+        logger=logging.getLogger("test"),
+        symbol_registry=_FakeRegistry(contract),  # type: ignore[arg-type]
+        runtime_state=state,
+    )
+    signal = EntrySignal(
+        kind=ParsedKind.ENTRY_SIGNAL,
+        raw_text="交易信號",
+        symbol="INXUSDT",
+        quote="USDT",
+        side=Side.LONG,
+        leverage=10,
+        entry_type=EntryType.MARKET,
+        entry_low=0.0,
+        entry_high=0.0,
+        entry_points=[],
+        stop_loss=None,
+        tp_points=[0.12, 0.13],
+    )
+    decision = RiskDecision(approved=True, entry_price=0.0115, notional=300.0)
+    result = executor.execute_thread_entry(
+        signal,
+        chat_id=1,
+        message_id=44,
+        version=1,
+        thread_id=9004,
+        risk_decision=decision,
+    )
+    assert result["placed"] == 1
+    row = store.conn.execute(
+        "SELECT intent_json FROM executions WHERE thread_id=9004 AND purpose='entry' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert row is not None
+    intent = json.loads(row["intent_json"])
+    assert intent["order_type"] == "market"
+    assert intent["price"] is None
+    assert intent["entry_points"] == [0.0115]
+    assert float(intent["quantity"]) > 0
+
+
+def test_market_entry_rejected_when_anchor_unavailable(tmp_path) -> None:
+    store = SQLiteStore(str(tmp_path / "split_market_no_anchor.db"))
+    state = StateStore()
+    contract = ContractInfo(symbol="INXUSDT", size_place=6, price_place=6, min_trade_num=0.0, raw={})
+    executor = TradeExecutor(
+        config=_config(),
+        bitget=_FakeBitget(),  # type: ignore[arg-type]
+        store=store,
+        notifier=Notifier(logging.getLogger("test")),
+        logger=logging.getLogger("test"),
+        symbol_registry=_FakeRegistry(contract),  # type: ignore[arg-type]
+        runtime_state=state,
+    )
+    signal = EntrySignal(
+        kind=ParsedKind.ENTRY_SIGNAL,
+        raw_text="交易信號",
+        symbol="INXUSDT",
+        quote="USDT",
+        side=Side.LONG,
+        leverage=10,
+        entry_type=EntryType.MARKET,
+        entry_low=0.0,
+        entry_high=0.0,
+        entry_points=[],
+    )
+    result = executor.execute_thread_entry(signal, chat_id=1, message_id=45, version=1, thread_id=9005)
+    assert result["placed"] == 0
+    assert result["failed"] == 1
+    row = store.conn.execute(
+        "SELECT status, reason FROM executions WHERE thread_id=9005 AND purpose='entry' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert row is not None
+    assert row["status"] == "REJECTED"
+    assert "market_entry_anchor_price_unavailable" in str(row["reason"])

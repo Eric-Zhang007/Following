@@ -5,9 +5,10 @@ import time
 import uuid
 from decimal import Decimal, ROUND_DOWN
 
+from trader.alerts import AlertManager
 from trader.bitget_client import BitgetClient
 from trader.config import AppConfig
-from trader.models import EntrySignal, ManageAction, OrderIntent, RiskDecision
+from trader.models import EntrySignal, EntryType, ManageAction, OrderIntent, RiskDecision
 from trader.notifier import Notifier
 from trader.state import OrderState, PositionState, StateStore, utc_now
 from trader.stoploss_manager import StopLossManager
@@ -26,6 +27,7 @@ class TradeExecutor:
         symbol_registry: SymbolRegistry | None = None,
         runtime_state: StateStore | None = None,
         stoploss_manager: StopLossManager | None = None,
+        alerts: AlertManager | None = None,
     ) -> None:
         self.config = config
         self.bitget = bitget
@@ -35,6 +37,7 @@ class TradeExecutor:
         self.symbol_registry = symbol_registry
         self.runtime_state = runtime_state
         self.stoploss_manager = stoploss_manager
+        self.alerts = alerts
 
     def execute_entry(
         self,
@@ -208,6 +211,17 @@ class TradeExecutor:
 
             order_id = exchange_order_id or client_order_id
             self.store.record_order_receipt(execution_id, str(order_id) if order_id else None, receipt)
+            self._emit_order_submitted(
+                symbol=signal.symbol,
+                side=side,
+                purpose="entry",
+                quantity=size,
+                order_type=order_type,
+                price=price,
+                thread_id=None,
+                order_id=str(order_id) if order_id else None,
+                client_order_id=client_order_id,
+            )
             self._ensure_entry_protection(
                 signal=signal,
                 decision=decision,
@@ -245,19 +259,54 @@ class TradeExecutor:
         message_id: int,
         version: int,
         thread_id: int,
+        risk_decision: RiskDecision | None = None,
     ) -> dict[str, int]:
         side = "buy" if signal.side.value == "LONG" else "sell"
         trade_side = "open" if self.config.bitget.position_mode == "hedge_mode" else None
         leverage = int(signal.leverage or 1)
+        is_market = signal.entry_type == EntryType.MARKET
         entry_points = [float(p) for p in (signal.entry_points or []) if float(p) > 0]
-        if not entry_points:
+        if is_market:
+            sizing_anchor = None
+            if risk_decision is not None and risk_decision.entry_price is not None and risk_decision.entry_price > 0:
+                sizing_anchor = float(risk_decision.entry_price)
+            elif entry_points:
+                sizing_anchor = float(entry_points[0])
+            elif signal.entry_high and signal.entry_high > 0:
+                sizing_anchor = float(signal.entry_high)
+            elif signal.entry_low and signal.entry_low > 0:
+                sizing_anchor = float(signal.entry_low)
+            if sizing_anchor is None or sizing_anchor <= 0:
+                self.store.record_execution(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    version=version,
+                    action_type="ENTRY",
+                    symbol=signal.symbol,
+                    side=signal.side.value,
+                    status="REJECTED",
+                    reason="market_entry_anchor_price_unavailable",
+                    intent={"thread_id": thread_id, "entry_points": entry_points, "entry_high": signal.entry_high},
+                    thread_id=thread_id,
+                    purpose="entry",
+                )
+                return {"placed": 0, "failed": 1}
+            entry_points = [float(sizing_anchor)]
+        elif not entry_points:
             entry_points = [float(signal.entry_high)]
         if len(entry_points) > 2:
             entry_points = entry_points[:2]
 
         notional = float(self.config.execution.per_trade_margin_usdt) * float(leverage)
+        if risk_decision is not None and risk_decision.notional is not None and risk_decision.notional > 0:
+            notional = min(notional, float(risk_decision.notional))
         qty_total_raw = notional / float(entry_points[0])
-        qty_parts = self._split_entry_quantities(qty_total_raw, len(entry_points))
+        qty_parts = self._split_entry_quantities(
+            qty_total_raw,
+            len(entry_points),
+            symbol=signal.symbol,
+            leverage=leverage,
+        )
 
         if self.config.risk.hard_invariants.no_size_zero_orders and qty_total_raw <= 0:
             self.store.record_execution(
@@ -283,12 +332,15 @@ class TradeExecutor:
         failed = 0
         for idx, price in enumerate(entry_points):
             qty_raw = qty_parts[idx]
-            qty, normalized_price, reject_reason = self._normalize_order_params(signal.symbol, qty_raw, float(price))
+            order_type = "market" if is_market else "limit"
+            qty, normalized_price, reject_reason = self._normalize_order_params(
+                signal.symbol, qty_raw, None if is_market else float(price)
+            )
             intent = {
                 "symbol": signal.symbol,
                 "side": side,
                 "trade_side": trade_side,
-                "order_type": "limit",
+                "order_type": order_type,
                 "quantity": qty,
                 "price": normalized_price,
                 "entry_index": idx,
@@ -350,7 +402,7 @@ class TradeExecutor:
                     side=side,
                     trade_side=trade_side,
                     size=qty,
-                    order_type="limit",
+                    order_type=order_type,
                     price=normalized_price,
                     reduce_only=False,
                     client_oid=client_order_id,
@@ -378,6 +430,17 @@ class TradeExecutor:
                             order_id=str(order_id),
                         )
                 self.store.record_order_receipt(execution_id, str(order_id) if order_id else None, receipt)
+                self._emit_order_submitted(
+                    symbol=signal.symbol,
+                    side=side,
+                    purpose="entry",
+                    quantity=qty,
+                    order_type=order_type,
+                    price=normalized_price,
+                    thread_id=thread_id,
+                    order_id=str(order_id) if order_id else None,
+                    client_order_id=client_order_id,
+                )
                 placed += 1
             except Exception as exc:  # noqa: BLE001
                 failed += 1
@@ -453,8 +516,164 @@ class TradeExecutor:
                 thread_id=thread_id,
                 purpose="manage",
             )
-            self.notifier.info(f"DRY_RUN MANAGE symbol={symbol} reduce={action.reduce_pct} be={action.move_sl_to_be}")
+            self.notifier.info(
+                f"DRY_RUN MANAGE symbol={symbol} add={action.add_pct} reduce={action.reduce_pct} be={action.move_sl_to_be}"
+            )
             return
+
+        if action.add_pct is not None:
+            resolved_thread_id = thread_id or self.store.find_latest_thread_id_by_symbol(symbol)
+            if resolved_thread_id is None:
+                self.store.record_execution(
+                    chat_id,
+                    message_id,
+                    version,
+                    action_type="MANAGE_ADD",
+                    symbol=symbol,
+                    side=None,
+                    status="REJECTED",
+                    reason="thread unresolved for manage add",
+                    intent={"symbol": symbol, "add_pct": action.add_pct},
+                    thread_id=thread_id,
+                    purpose="manage_add",
+                )
+                self.notifier.warning("MANAGE add rejected: thread unresolved")
+            else:
+                thread_id = resolved_thread_id
+                add_count = self.store.count_thread_actions(resolved_thread_id, "MANAGE_ADD")
+                if add_count >= self.config.execution.max_manage_add_times_per_thread:
+                    self.store.record_execution(
+                        chat_id,
+                        message_id,
+                        version,
+                        action_type="MANAGE_ADD",
+                        symbol=symbol,
+                        side=None,
+                        status="REJECTED",
+                        reason=(
+                            f"manage add exceeded limit: {add_count}/"
+                            f"{self.config.execution.max_manage_add_times_per_thread}"
+                        ),
+                        intent={"symbol": symbol, "add_pct": action.add_pct, "add_count": add_count},
+                        thread_id=resolved_thread_id,
+                        purpose="manage_add",
+                    )
+                    self.notifier.warning(
+                        f"MANAGE add rejected: reached limit {add_count}/{self.config.execution.max_manage_add_times_per_thread}"
+                    )
+                else:
+                    try:
+                        position_payload = self.bitget.get_position(symbol)
+                        position = self._pick_position(position_payload)
+                        position_size = abs(float(position.get("total", position.get("size", 0)) or 0.0))
+                        hold_side = self._extract_hold_side(position)
+
+                        if position_size <= 0:
+                            self.store.record_execution(
+                                chat_id,
+                                message_id,
+                                version,
+                                action_type="MANAGE_ADD",
+                                symbol=symbol,
+                                side=None,
+                                status="REJECTED",
+                                reason="no position to add",
+                                intent={"symbol": symbol, "add_pct": action.add_pct},
+                                thread_id=resolved_thread_id,
+                                purpose="manage_add",
+                            )
+                            self.notifier.warning(f"MANAGE add rejected: no position for {symbol}")
+                        else:
+                            add_qty_raw = position_size * (float(action.add_pct) / 100.0)
+                            side = "buy" if hold_side == "long" else "sell"
+                            trade_side = "open" if self.config.bitget.position_mode == "hedge_mode" else None
+                            add_qty, _, reject_reason = self._normalize_order_params(symbol, add_qty_raw, None)
+                            intent = OrderIntent(
+                                action_type="MANAGE_ADD",
+                                symbol=symbol,
+                                side=side,
+                                trade_side=trade_side,
+                                order_type="market",
+                                quantity=add_qty,
+                                price=None,
+                                reduce_only=False,
+                                source_chat_id=chat_id,
+                                source_message_id=message_id,
+                                source_version=version,
+                                note=f"add_pct={action.add_pct}",
+                            )
+                            if reject_reason:
+                                self.store.record_execution(
+                                    chat_id,
+                                    message_id,
+                                    version,
+                                    action_type="MANAGE_ADD",
+                                    symbol=symbol,
+                                    side=side,
+                                    status="REJECTED",
+                                    reason=reject_reason,
+                                    intent=intent.to_dict(),
+                                    thread_id=resolved_thread_id,
+                                    purpose="manage_add",
+                                )
+                                self.notifier.warning(f"MANAGE add rejected: {reject_reason}")
+                            else:
+                                receipt = self.bitget.place_order(
+                                    symbol=symbol,
+                                    side=side,
+                                    trade_side=trade_side,
+                                    size=add_qty,
+                                    order_type="market",
+                                    reduce_only=False,
+                                )
+                                execution_id = self.store.record_execution(
+                                    chat_id,
+                                    message_id,
+                                    version,
+                                    action_type="MANAGE_ADD",
+                                    symbol=symbol,
+                                    side=side,
+                                    status="EXECUTED",
+                                    reason=None,
+                                    intent=intent.to_dict(),
+                                    thread_id=resolved_thread_id,
+                                    purpose="manage_add",
+                                )
+                                order_id = None
+                                if isinstance(receipt, dict):
+                                    order_id = receipt.get("orderId") or receipt.get("clientOid")
+                                self.store.record_order_receipt(execution_id, str(order_id) if order_id else None, receipt)
+                                self._emit_order_submitted(
+                                    symbol=symbol,
+                                    side=side,
+                                    purpose="manage_add",
+                                    quantity=add_qty,
+                                    order_type="market",
+                                    price=None,
+                                    thread_id=resolved_thread_id,
+                                    order_id=str(order_id) if order_id else None,
+                                    client_order_id=None,
+                                )
+                                self.notifier.info(
+                                    f"EXECUTED MANAGE add {symbol} qty={add_qty} add_pct={action.add_pct} "
+                                    f"count={add_count + 1}/{self.config.execution.max_manage_add_times_per_thread}"
+                                )
+                    except Exception as exc:  # noqa: BLE001
+                        self.logger.exception("execute_manage add failed")
+                        self.store.record_execution(
+                            chat_id,
+                            message_id,
+                            version,
+                            action_type="MANAGE_ADD",
+                            symbol=symbol,
+                            side=None,
+                            status="FAILED",
+                            reason=str(exc),
+                            intent={"symbol": symbol, "add_pct": action.add_pct},
+                            thread_id=resolved_thread_id,
+                            purpose="manage_add",
+                        )
+                        self.notifier.error(f"MANAGE add failed {symbol}: {exc}")
 
         if action.reduce_pct is not None:
             try:
@@ -543,6 +762,17 @@ class TradeExecutor:
                 if isinstance(receipt, dict):
                     order_id = receipt.get("orderId") or receipt.get("clientOid")
                 self.store.record_order_receipt(execution_id, str(order_id) if order_id else None, receipt)
+                self._emit_order_submitted(
+                    symbol=symbol,
+                    side=side,
+                    purpose="manage_reduce",
+                    quantity=close_qty,
+                    order_type="market",
+                    price=None,
+                    thread_id=thread_id,
+                    order_id=str(order_id) if order_id else None,
+                    client_order_id=None,
+                )
                 self.notifier.info(
                     f"EXECUTED MANAGE reduce {symbol} qty={close_qty} reduce_pct={action.reduce_pct}"
                 )
@@ -792,6 +1022,16 @@ class TradeExecutor:
     ) -> dict[str, int]:
         if self.runtime_state is None:
             return {"replaced": 0, "canceled": 0}
+        if signal.entry_type == EntryType.MARKET:
+            self.store.record_event(
+                event_type="ENTRY_EDIT_MARKET_IGNORED",
+                level="WARN",
+                msg="ignore root edit for market entry to avoid duplicate re-entry",
+                payload={"thread_id": thread_id, "symbol": signal.symbol},
+                reason="market_edit_blocked",
+                thread_id=thread_id,
+            )
+            return {"replaced": 0, "canceled": 0}
         orders = [
             o
             for o in self.runtime_state.orders_by_client_id.values()
@@ -867,14 +1107,22 @@ class TradeExecutor:
             return True
 
         if hasattr(self.bitget, "supports_plan_orders") and not self.bitget.supports_plan_orders():
-            self.store.record_event(
-                event_type="PLAN_ORDER_FALLBACK",
-                level="ERROR",
-                msg="be_reduce trigger unavailable; fallback skipped",
-                payload={"thread_id": thread_id, "symbol": symbol, "purpose": "be_reduce"},
-                reason="plan_order_unsupported",
-                thread_id=thread_id,
-            )
+            payload = {"thread_id": thread_id, "symbol": symbol, "purpose": "be_reduce"}
+            if self.alerts is not None:
+                self.alerts.error(
+                    "PLAN_ORDER_FALLBACK",
+                    "be_reduce trigger unavailable; fallback skipped",
+                    payload,
+                )
+            else:
+                self.store.record_event(
+                    event_type="PLAN_ORDER_FALLBACK",
+                    level="ERROR",
+                    msg="be_reduce trigger unavailable; fallback skipped",
+                    payload=payload,
+                    reason="plan_order_unsupported",
+                    thread_id=thread_id,
+                )
             return False
 
         try:
@@ -1089,17 +1337,55 @@ class TradeExecutor:
             return False
         return self.config.risk.stoploss.sl_order_type == "local_guard"
 
+    def _emit_order_submitted(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        purpose: str,
+        quantity: float,
+        order_type: str,
+        price: float | None,
+        thread_id: int | None,
+        order_id: str | None,
+        client_order_id: str | None,
+    ) -> None:
+        if self.alerts is None:
+            return
+        self.alerts.info(
+            "ORDER_SUBMITTED",
+            "order submitted to exchange",
+            {
+                "symbol": symbol,
+                "side": side,
+                "purpose": purpose,
+                "quantity": quantity,
+                "order_type": order_type,
+                "price": price,
+                "thread_id": thread_id,
+                "order_id": order_id,
+                "client_order_id": client_order_id,
+            },
+        )
+
     @staticmethod
     def _round_down(value: float, decimals: int) -> float:
         q = Decimal(1).scaleb(-max(decimals, 0))
         return float(Decimal(str(value)).quantize(q, rounding=ROUND_DOWN))
 
-    def _split_entry_quantities(self, qty_total: float, parts: int) -> list[float]:
+    def _split_entry_quantities(
+        self,
+        qty_total: float,
+        parts: int,
+        *,
+        symbol: str | None = None,
+        leverage: int | None = None,
+    ) -> list[float]:
         if qty_total <= 0 or parts <= 0:
             return []
         if parts == 1:
             return [qty_total]
-        ratio = list(self.config.execution.entry_split_ratio)
+        ratio = self._resolve_entry_split_ratio(symbol=symbol, leverage=leverage)
         if len(ratio) < parts:
             ratio = ratio + [ratio[-1]] * (parts - len(ratio))
         ratio = ratio[:parts]
@@ -1116,6 +1402,18 @@ class TradeExecutor:
                 used += chunk
             out.append(chunk)
         return out
+
+    def _resolve_entry_split_ratio(self, *, symbol: str | None, leverage: int | None) -> list[int]:
+        configured = list(self.config.execution.entry_split_ratio)
+        if not configured:
+            configured = [1, 2]
+
+        sym = str(symbol or "").upper()
+        lv = int(leverage or 0)
+        # Conservative split for majors or high leverage; otherwise use configured ratio.
+        if sym in {"BTCUSDT", "ETHUSDT"} or lv >= 50:
+            return [1, 1]
+        return configured
 
     @staticmethod
     def _extract_hold_side(position: dict) -> str:
@@ -1163,13 +1461,21 @@ class TradeExecutor:
             parent_client_order_id=parent_client_order_id,
         )
         if not result.ok:
-            self.store.record_event(
-                event_type="STOPLOSS_PLACE_FAIL",
-                level="ERROR",
-                msg="entry protection stop-loss ensure failed",
-                payload={"symbol": signal.symbol, "reason": result.reason},
-                reason=result.reason,
-            )
+            payload = {"symbol": signal.symbol, "reason": result.reason}
+            if self.alerts is not None:
+                self.alerts.error(
+                    "STOPLOSS_PLACE_FAIL",
+                    "entry protection stop-loss ensure failed",
+                    payload,
+                )
+            else:
+                self.store.record_event(
+                    event_type="STOPLOSS_PLACE_FAIL",
+                    level="ERROR",
+                    msg="entry protection stop-loss ensure failed",
+                    payload=payload,
+                    reason=result.reason,
+                )
             self.notifier.warning(f"ENTRY stop-loss ensure failed: {result.reason}")
         self._place_take_profit_orders(
             symbol=signal.symbol,
@@ -1188,6 +1494,7 @@ class TradeExecutor:
         tp_list: list[float],
         parent_client_order_id: str | None,
     ) -> dict[str, int | str | None]:
+        started_at = time.perf_counter()
         if not tp_list:
             return {"placed": 0, "skipped": 0, "last_reason": "tp_list_empty"}
 
@@ -1200,6 +1507,21 @@ class TradeExecutor:
                 payload={"symbol": symbol, "reason": "size_unknown", "tp_count": len(tp_list)},
             )
             self.notifier.warning(f"TP skipped for {symbol}: size unknown")
+            if self.alerts is not None and not self.config.dry_run:
+                self.alerts.error(
+                    "TP_SUBMIT_FAILED",
+                    "failed to submit take-profit orders",
+                    {
+                        "symbol": symbol,
+                        "purpose": "tp",
+                        "failed_count": len(tp_list),
+                        "tp_total": len(tp_list),
+                        "placed": 0,
+                        "reason": "size_unknown",
+                        "elapsed_ms": max(0, int((time.perf_counter() - started_at) * 1000)),
+                        "source": "executor",
+                    },
+                )
             return {"placed": 0, "skipped": len(tp_list), "last_reason": "size_unknown"}
 
         resolved_side = side_hint or self._resolve_position_side_hint(symbol) or "LONG"
@@ -1211,10 +1533,10 @@ class TradeExecutor:
         placed = 0
         skipped = 0
         last_reason: str | None = None
-        size_each_raw = resolved_total_size / len(tp_list)
+        remaining_size = float(resolved_total_size)
         for idx, tp in enumerate(tp_list):
-            remaining = resolved_total_size - (size_each_raw * idx)
-            requested_size = min(size_each_raw, max(remaining, 0.0))
+            legs_left = len(tp_list) - idx
+            requested_size = remaining_size if idx == len(tp_list) - 1 else (remaining_size / max(legs_left, 1))
             normalized_size, _, reject_reason = self._normalize_order_params(symbol, requested_size, None)
             if reject_reason or normalized_size <= 0:
                 skipped += 1
@@ -1269,6 +1591,7 @@ class TradeExecutor:
                             )
                         )
                     placed += 1
+                    remaining_size = max(0.0, remaining_size - order_size)
                     continue
                 ack = self.bitget.place_take_profit(
                     symbol=symbol,
@@ -1321,6 +1644,38 @@ class TradeExecutor:
                         "size": order_size,
                     },
                 )
+                continue
+            remaining_size = max(0.0, remaining_size - order_size)
+        if placed > 0 and self.alerts is not None and not self.config.dry_run:
+            self.alerts.info(
+                "TP_SUBMITTED",
+                "take-profit orders submitted",
+                {
+                    "symbol": symbol,
+                    "purpose": "tp",
+                    "tp_count": placed,
+                    "tp_total": len(tp_list),
+                    "skipped": skipped,
+                    "total_size": resolved_total_size,
+                    "elapsed_ms": max(0, int((time.perf_counter() - started_at) * 1000)),
+                    "source": "executor",
+                },
+            )
+        if skipped > 0 and self.alerts is not None and not self.config.dry_run:
+            self.alerts.error(
+                "TP_SUBMIT_FAILED",
+                "failed to submit take-profit orders",
+                {
+                    "symbol": symbol,
+                    "purpose": "tp",
+                    "failed_count": skipped,
+                    "tp_total": len(tp_list),
+                    "placed": placed,
+                    "reason": last_reason,
+                    "elapsed_ms": max(0, int((time.perf_counter() - started_at) * 1000)),
+                    "source": "executor",
+                },
+            )
         return {"placed": placed, "skipped": skipped, "last_reason": last_reason}
 
     def _resolve_total_tp_size(self, symbol: str) -> float | None:

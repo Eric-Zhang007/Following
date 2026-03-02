@@ -167,6 +167,10 @@ class StateStore:
                 if order.status.upper() not in {"FILLED", "CANCELED", "REJECTED", "FAILED"}
             ]
 
+    def all_orders(self) -> list[OrderState]:
+        with self._lock:
+            return self._all_orders_locked()
+
     def clear_orders_for_symbol(self, symbol: str) -> None:
         with self._lock:
             key = symbol.upper()
@@ -187,7 +191,7 @@ class StateStore:
         with self._lock:
             return {
                 order.symbol.upper()
-                for order in self.orders_by_client_id.values()
+                for order in self._all_orders_locked()
                 if order.purpose.lower() in {"entry", "entry_partial"} and order.status.upper() != "REJECTED"
             }
 
@@ -221,7 +225,7 @@ class StateStore:
             guard = self.local_guard_stops.get(_guard_key(symbol, position_side))
             if guard and guard.active:
                 return True
-            for order in self.orders_by_client_id.values():
+            for order in self._all_orders_locked():
                 if order.symbol.upper() != symbol.upper():
                     continue
                 if order.purpose.lower() != "sl":
@@ -238,7 +242,7 @@ class StateStore:
     def get_stop_loss_order(self, symbol: str, position_side: str) -> OrderState | None:
         expected_close_side = "sell" if position_side.lower() == "long" else "buy"
         with self._lock:
-            for order in self.orders_by_client_id.values():
+            for order in self._all_orders_locked():
                 if order.symbol.upper() != symbol.upper():
                     continue
                 if order.purpose.lower() != "sl":
@@ -422,6 +426,18 @@ class StateStore:
                 "last_ws_message_at": self.last_ws_message_at.isoformat() if self.last_ws_message_at else None,
                 "last_reconciler_ok_at": self.last_reconciler_ok_at.isoformat() if self.last_reconciler_ok_at else None,
             }
+
+    def _all_orders_locked(self) -> list[OrderState]:
+        # Merge client-id and exchange-id indices so manually created exchange orders
+        # (which may not carry clientOid) are still visible to risk/protection checks.
+        merged: dict[tuple[str | None, str | None], OrderState] = {}
+        for order in self.orders_by_client_id.values():
+            key = (order.client_order_id, order.order_id)
+            merged[key] = order
+        for order in self.orders_by_exchange_id.values():
+            key = (order.client_order_id, order.order_id)
+            merged[key] = order
+        return list(merged.values())
 
 
 def utc_now() -> datetime:

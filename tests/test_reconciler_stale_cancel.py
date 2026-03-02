@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from datetime import timedelta
 
 from trader.alerts import AlertManager
 from trader.config import AppConfig
@@ -9,33 +10,27 @@ from trader.state import OrderState, StateStore, utc_now
 from trader.store import SQLiteStore
 
 
-class FakeBitgetPartial:
+class FakeBitgetStale:
     def __init__(self) -> None:
-        self.sl_orders = 0
+        self.canceled: list[tuple[str, str]] = []
 
-    def get_order_state(self, symbol: str, order_id: str | None = None, client_order_id: str | None = None):
+    def get_order_state(self, symbol: str, order_id: str | None = None, client_order_id: str | None = None, is_plan_order: bool = False):  # noqa: ARG002
+        created_ms = int((utc_now() - timedelta(days=4)).timestamp() * 1000)
         return {
-            "state": "PARTIAL",
-            "baseVolume": "1.5",
-            "priceAvg": "100.2",
+            "symbol": symbol,
             "orderId": order_id,
             "clientOid": client_order_id,
+            "state": "live",
+            "baseVolume": "0",
+            "cTime": str(created_ms),
         }
+
+    def cancel_order(self, symbol: str, order_id: str):
+        self.canceled.append((symbol, order_id))
+        return {"ok": True}
 
     def supports_plan_orders(self):
         return True
-
-    def place_stop_loss(self, **kwargs):
-        self.sl_orders += 1
-        return type(
-            "Ack",
-            (),
-            {
-                "order_id": "sl-001",
-                "client_oid": kwargs.get("client_oid", "sl-client"),
-                "status": "ACKED",
-            },
-        )()
 
 
 def _config() -> AppConfig:
@@ -53,8 +48,8 @@ def _config() -> AppConfig:
                 "position_mode": "one_way_mode",
             },
             "filters": {
-                "symbol_policy": "ALLOWLIST",
-                "symbol_whitelist": ["BTCUSDT"],
+                "symbol_policy": "ALLOW_ALL",
+                "symbol_whitelist": [],
                 "symbol_blacklist": [],
                 "require_exchange_symbol": False,
                 "min_usdt_volume_24h": None,
@@ -67,10 +62,10 @@ def _config() -> AppConfig:
                 "account_risk_per_trade": 0.003,
                 "max_notional_per_trade": 200,
                 "default_stop_loss_pct": 0.006,
-                "stoploss": {
-                    "sl_order_type": "trigger",
-                },
                 "assumed_equity_usdt": 1000,
+            },
+            "execution": {
+                "cancel_unfilled_after_hours": 72,
             },
             "logging": {"level": "INFO", "file": "trader.log", "rich": False},
             "monitor": {"enabled": True},
@@ -78,43 +73,37 @@ def _config() -> AppConfig:
     )
 
 
-def test_reconciler_partial_fill_places_proportional_sl_and_records_reason(tmp_path) -> None:
-    store = SQLiteStore(str(tmp_path / "reconcile.db"))
+def test_reconcile_stale_unfilled_entry_cancels_order(tmp_path) -> None:
+    store = SQLiteStore(str(tmp_path / "stale_cancel.db"))
     alerts = AlertManager(Notifier(logging.getLogger("test")), store, logging.getLogger("test"))
     state = StateStore()
     state.upsert_order(
         OrderState(
-            symbol="BTCUSDT",
+            symbol="INXUSDT",
             side="buy",
-            status="NEW",
+            status="ACKED",
             filled=0.0,
-            quantity=2.0,
+            quantity=1000.0,
             avg_price=None,
             reduce_only=False,
-            trade_side=None,
+            trade_side="open",
             purpose="entry",
             timestamp=utc_now(),
-            client_order_id="entry-abc",
-            order_id="1001",
+            client_order_id="entry-14-0-abcd",
+            order_id="111122223333",
+            thread_id=14,
         )
     )
-
-    bitget = FakeBitgetPartial()
+    bitget = FakeBitgetStale()
     reconciler = OrderReconciler(_config(), bitget, state, store, alerts)
     asyncio.run(reconciler.reconcile_once())
 
-    assert bitget.sl_orders == 1
-    sl_order = state.find_order(order_id="sl-001")
-    assert sl_order is not None
-    assert sl_order.purpose == "sl"
+    order = state.find_order(client_order_id="entry-14-0-abcd")
+    assert order is not None
+    assert order.status == "CANCELED"
+    assert bitget.canceled == [("INXUSDT", "111122223333")]
 
     row = store.conn.execute(
-        "SELECT action, reason FROM reconciler_actions WHERE action='PARTIAL_FILL_ENSURE_SL' ORDER BY id DESC LIMIT 1"
+        "SELECT id FROM reconciler_actions WHERE action='ORDER_STALE_CANCELED' ORDER BY id DESC LIMIT 1"
     ).fetchone()
     assert row is not None
-    assert row["reason"] in {"submitted", "dry_run"}
-
-    fill_event = store.conn.execute(
-        "SELECT type, payload_json FROM events WHERE type='ORDER_FILLED' ORDER BY id DESC LIMIT 1"
-    ).fetchone()
-    assert fill_event is not None

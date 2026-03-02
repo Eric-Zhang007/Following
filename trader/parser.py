@@ -12,6 +12,7 @@ ENTRY_RANGE_RE = re.compile(
     re.IGNORECASE,
 )
 REDUCE_RE = re.compile(r"减仓\s*(\d{1,3})(?:\s*[%％])?", re.IGNORECASE)
+ADD_RE = re.compile(r"(?:补仓|補倉|加仓|加倉|加碼)\s*(\d{1,3})?(?:\s*[%％])?", re.IGNORECASE)
 TP_RE = re.compile(r"TP\s*\d*\s*(?:看|到|:|：)?\s*([0-9]*\.?[0-9]+)", re.IGNORECASE)
 STOP_RE = re.compile(r"(?:止损|SL)\s*[:：]?\s*([0-9]*\.?[0-9]+)", re.IGNORECASE)
 ENTRY_TP_RE = re.compile(r"(?:止盈|TP)\s*\d*\s*(?:看|到|:|：)?\s*([0-9]*\.?[0-9]+)", re.IGNORECASE)
@@ -95,13 +96,18 @@ class SignalParser:
     def _parse_manage(self, text: str, timestamp: datetime | None) -> ManageAction | None:
         reduce_match = REDUCE_RE.search(text)
         reduce_pct = float(reduce_match.group(1)) if reduce_match else None
+        add_match = ADD_RE.search(text)
+        add_pct: float | None = None
+        if add_match:
+            add_raw = add_match.group(1)
+            add_pct = float(add_raw) if add_raw else 100.0
 
         move_sl_to_be = any(token in text for token in ["保本", "设保本", "移到开仓价", "止损到开仓价"])
 
         tp_match = TP_RE.search(text)
         tp_price = float(tp_match.group(1)) if tp_match else None
 
-        if reduce_pct is None and not move_sl_to_be and tp_price is None and "留底仓" not in text:
+        if reduce_pct is None and add_pct is None and not move_sl_to_be and tp_price is None and "留底仓" not in text:
             return None
 
         symbol_match = SYMBOL_RE.search(text)
@@ -114,6 +120,7 @@ class SignalParser:
             raw_text=text,
             symbol=symbol,
             reduce_pct=reduce_pct,
+            add_pct=add_pct,
             move_sl_to_be=move_sl_to_be,
             tp_price=tp_price,
             note=text[:200],

@@ -24,13 +24,14 @@ class RiskManager:
         within_cooldown: bool,
         open_positions_count: int = 0,
         signal_quality: float = 1.0,
+        ignore_signal_age: bool = False,
     ) -> RiskDecision:
         symbol = signal.symbol.upper()
         side = signal.side.value
         warnings: list[str] = []
 
         if not self.config.risk.enabled:
-            entry_price = self._pick_limit_price(signal)
+            entry_price = self._pick_limit_price(signal, current_price=current_price)
             if entry_price <= 0:
                 return RiskDecision.reject("entry_price <= 0")
             stop_loss_price, stop_distance = self._resolve_stop_loss(signal, entry_price)
@@ -104,7 +105,7 @@ class RiskManager:
             if signal_time.tzinfo is None:
                 signal_time = signal_time.replace(tzinfo=timezone.utc)
             age_sec = (now - signal_time).total_seconds()
-            if age_sec > self.config.filters.max_signal_age_seconds:
+            if age_sec > self.config.filters.max_signal_age_seconds and not ignore_signal_age:
                 return RiskDecision.reject(f"signal too old: {age_sec:.1f}s")
 
         if self._stoploss_cooldown_until is not None and now < self._stoploss_cooldown_until:
@@ -136,25 +137,21 @@ class RiskManager:
         if current_price <= 0:
             return RiskDecision.reject("invalid market price")
 
-        if signal.entry_type == EntryType.LIMIT:
-            if current_price < signal.entry_low:
-                deviation = (signal.entry_low - current_price) / signal.entry_low
-            elif current_price > signal.entry_high:
-                deviation = (current_price - signal.entry_high) / signal.entry_high
-            else:
-                deviation = 0.0
+        max_slippage = self._ratio_from_percent_or_ratio(
+            self.config.risk.entry_slippage_pct
+            if self.config.risk.entry_slippage_pct is not None
+            else self.config.risk.max_entry_slippage_pct
+        )
+        if signal.entry_type == EntryType.MARKET:
+            anchor = signal.entry_high if signal.entry_high > 0 else signal.entry_low
+            if anchor > 0:
+                deviation = abs(current_price - anchor) / anchor
+                if deviation > max_slippage:
+                    return RiskDecision.reject(
+                        f"market anchor deviation {deviation:.4f} exceeds max_entry_slippage_pct {max_slippage:.4f}"
+                    )
 
-            max_slippage = self._ratio_from_percent_or_ratio(
-                self.config.risk.entry_slippage_pct
-                if self.config.risk.entry_slippage_pct is not None
-                else self.config.risk.max_entry_slippage_pct
-            )
-            if deviation > max_slippage:
-                return RiskDecision.reject(
-                    f"price deviation {deviation:.4f} exceeds max_entry_slippage_pct {max_slippage:.4f}"
-                )
-
-        entry_price = self._pick_limit_price(signal)
+        entry_price = self._pick_limit_price(signal, current_price=current_price)
         if entry_price <= 0:
             return RiskDecision.reject("entry_price <= 0")
 
@@ -196,8 +193,10 @@ class RiskManager:
 
         if action.reduce_pct is not None and (action.reduce_pct <= 0 or action.reduce_pct > 100):
             return RiskDecision.reject(f"invalid reduce_pct: {action.reduce_pct}")
+        if action.add_pct is not None and (action.add_pct <= 0 or action.add_pct > 200):
+            return RiskDecision.reject(f"invalid add_pct: {action.add_pct}")
 
-        if action.reduce_pct is None and not action.move_sl_to_be and action.tp_price is None:
+        if action.reduce_pct is None and action.add_pct is None and not action.move_sl_to_be and action.tp_price is None:
             return RiskDecision.reject("manage action has no executable fields")
 
         return RiskDecision(approved=True, symbol=action.symbol)
@@ -287,10 +286,15 @@ class RiskManager:
             return value / 100.0
         return value
 
-    def _pick_limit_price(self, signal: EntrySignal) -> float:
+    def _pick_limit_price(self, signal: EntrySignal, current_price: float | None = None) -> float:
         strategy = self.config.execution.limit_price_strategy
         if signal.entry_type == EntryType.MARKET:
-            return signal.entry_high
+            anchor = signal.entry_high if signal.entry_high > 0 else signal.entry_low
+            if anchor > 0:
+                return anchor
+            if current_price is not None and current_price > 0:
+                return current_price
+            return 0.0
 
         if strategy == "LOW":
             return signal.entry_low
