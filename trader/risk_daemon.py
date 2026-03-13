@@ -485,14 +485,30 @@ class RiskDaemon:
         if not tp_points:
             return
         tp_guard_key = f"tp_submit_guard::{position.symbol.upper()}::{position.side.lower()}::{thread_id}"
+        tp_progress_key = f"tp_progress::{position.symbol.upper()}::{thread_id}"
         last_tp_submit = self.store.get_system_flag(tp_guard_key)
+        last_tp_progress = self.store.get_system_flag(tp_progress_key)
+        last_tp_submit_ts = None
+        last_tp_progress_ts = None
+        try:
+            last_tp_submit_ts = float(last_tp_submit) if last_tp_submit is not None else None
+        except Exception:  # noqa: BLE001
+            last_tp_submit_ts = None
+        try:
+            last_tp_progress_ts = float(last_tp_progress) if last_tp_progress is not None else None
+        except Exception:  # noqa: BLE001
+            last_tp_progress_ts = None
+        bypass_submit_cooldown = (
+            last_tp_progress_ts is not None
+            and (last_tp_submit_ts is None or last_tp_progress_ts >= last_tp_submit_ts)
+        )
         if last_tp_submit is not None:
             try:
-                if now_ts - float(last_tp_submit) < 120.0:
+                if not bypass_submit_cooldown and now_ts - float(last_tp_submit) < 120.0:
                     return
             except Exception:  # noqa: BLE001
                 pass
-        if now_ts < float(self._tp_retry_after.get(tp_key, 0.0)):
+        if not bypass_submit_cooldown and now_ts < float(self._tp_retry_after.get(tp_key, 0.0)):
             return
         if self._has_active_tp(position, thread_id, tp_points=tp_points):
             self.store.set_system_flag(tp_guard_key, str(now_ts))

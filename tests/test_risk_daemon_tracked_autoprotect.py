@@ -465,3 +465,55 @@ def test_filled_tp_only_rearms_remaining_targets(tmp_path) -> None:
 
     assert bitget.tp_calls == 2
     assert bitget.tp_sizes == [325.0, 325.0]
+
+
+def test_filled_tp_bypasses_recent_submit_cooldown_for_remaining_targets(tmp_path) -> None:
+    store = SQLiteStore(str(tmp_path / "tracked_autoprotect_tp_progress.db"))
+    alerts = AlertManager(Notifier(logging.getLogger("test")), store, logging.getLogger("test"))
+    state = StateStore()
+    state.set_account(equity=1000, available=900, margin_used=100)
+    state.set_positions(
+        [
+            PositionState(
+                symbol="INXUSDT",
+                side="long",
+                size=650.0,
+                entry_price=0.1,
+                mark_price=0.1,
+                liq_price=0.05,
+                pnl=0.0,
+                leverage=10,
+                margin_mode="isolated",
+                timestamp=utc_now(),
+                opened_at=utc_now(),
+                unknown_origin=False,
+            )
+        ]
+    )
+    store.upsert_trade_thread(
+        thread_id=19,
+        symbol="INXUSDT",
+        side="LONG",
+        leverage=10,
+        stop_loss=0.0865,
+        tp_points=[0.15, 0.18, 0.2],
+        status="ACTIVE",
+    )
+    store.mark_tp_point_filled(thread_id=19, tp_price=0.15)
+    now_ts = utc_now().timestamp()
+    store.set_system_flag("tp_submit_guard::INXUSDT::long::19", str(now_ts))
+    store.set_system_flag("tp_progress::INXUSDT::19", str(now_ts + 1.0))
+
+    bitget = FakeBitgetTrackedProtect()
+    daemon = RiskDaemon(
+        config=_config(),
+        bitget=bitget,
+        state=state,
+        store=store,
+        alerts=alerts,
+        kill_switch=KillSwitch(store=store, file_path=str(tmp_path / "NO_SWITCH")),
+    )
+    asyncio.run(daemon.tick_once())
+
+    assert bitget.tp_calls == 2
+    assert bitget.tp_sizes == [325.0, 325.0]

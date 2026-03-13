@@ -510,6 +510,8 @@ class OrderReconciler:
         if order.thread_id is None or order.trigger_price is None:
             return
         remaining_tp_points = self.store.mark_tp_point_filled(thread_id=order.thread_id, tp_price=float(order.trigger_price))
+        progress_key = f"tp_progress::{order.symbol.upper()}::{order.thread_id}"
+        self.store.set_system_flag(progress_key, str(utc_now().timestamp()))
         self.store.record_reconciler_action(
             symbol=order.symbol,
             order_id=order.order_id,

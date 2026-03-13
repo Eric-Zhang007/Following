@@ -173,3 +173,34 @@ def test_adaptive_margin_ignores_max_margin_cap_and_uses_ratio_value(tmp_path) -
     intent = json.loads(str(row["intent_json"]))
     # available=5000, adaptive_ratio=0.04 => margin should be 200, not capped to 100.
     assert abs(float(intent["margin_usdt_per_entry"]) - 200.0) < 1e-6
+
+
+def test_light_position_halves_margin_per_entry(tmp_path) -> None:
+    store = SQLiteStore(str(tmp_path / "adaptive_light_position.db"))
+    state = StateStore()
+    state.set_account(equity=1000, available=600, margin_used=0, timestamp=utc_now())
+    contract = ContractInfo(symbol="BTCUSDT", size_place=6, price_place=6, min_trade_num=0.0, raw={})
+    executor = TradeExecutor(
+        config=_config(),
+        bitget=_FakeBitget(),  # type: ignore[arg-type]
+        store=store,
+        notifier=Notifier(logging.getLogger("test")),
+        logger=logging.getLogger("test"),
+        symbol_registry=_FakeRegistry(contract),  # type: ignore[arg-type]
+        runtime_state=state,
+    )
+    signal = _signal(leverage=50)
+    signal.raw_text = "BTC/USDT (50X輕倉做多)"
+
+    result = executor.execute_thread_entry(signal, chat_id=1, message_id=4, version=1, thread_id=104)
+    assert result["placed"] == 1
+
+    row = store.conn.execute(
+        "SELECT intent_json FROM executions WHERE thread_id=104 AND purpose='entry' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert row is not None
+    intent = json.loads(str(row["intent_json"]))
+    assert abs(float(intent["margin_usdt_per_entry"]) - 12.0) < 1e-6
+    assert abs(float(intent["notional_per_entry"]) - 600.0) < 1e-6
+    assert intent["margin_multiplier"] == 0.5
+    assert intent["light_position"] is True

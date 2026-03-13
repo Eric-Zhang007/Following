@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 import time
 import uuid
 from decimal import Decimal, ROUND_DOWN
@@ -16,6 +17,8 @@ from trader.state import OrderState, PositionState, StateStore, utc_now
 from trader.stoploss_manager import StopLossManager
 from trader.store import SQLiteStore
 from trader.symbol_registry import SymbolRegistry
+
+_LIGHT_POSITION_RE = re.compile(r"(?:轻仓|輕倉)", re.IGNORECASE)
 
 
 class TradeExecutor:
@@ -307,6 +310,8 @@ class TradeExecutor:
             margin_usdt_per_entry, adaptive_margin_ctx = self._adaptive_margin_usdt(leverage)
         else:
             margin_usdt_per_entry = float(self.config.execution.per_trade_margin_usdt)
+        margin_multiplier = self._margin_multiplier_for_signal(signal)
+        margin_usdt_per_entry *= margin_multiplier
 
         notional_per_entry = float(margin_usdt_per_entry) * float(leverage)
         qty_parts = [notional_per_entry / float(price) for price in entry_points]
@@ -362,6 +367,8 @@ class TradeExecutor:
                 "effective_leverage": leverage,
                 "margin_sizing_mode": self.config.execution.margin_sizing_mode,
                 "margin_usdt_per_entry": margin_usdt_per_entry,
+                "margin_multiplier": margin_multiplier,
+                "light_position": margin_multiplier < 1.0,
                 "quantity": qty,
                 "price": normalized_price,
                 "entry_index": idx,
@@ -1521,6 +1528,13 @@ class TradeExecutor:
             "clamped_margin_usdt": margin_usdt,
             "max_margin_usdt_config": float(cfg.adaptive_margin_max_usdt),
         }
+
+    @staticmethod
+    def _margin_multiplier_for_signal(signal: EntrySignal) -> float:
+        raw_text = str(signal.raw_text or "")
+        if _LIGHT_POSITION_RE.search(raw_text):
+            return 0.5
+        return 1.0
 
     @staticmethod
     def _round_down(value: float, decimals: int) -> float:
