@@ -55,12 +55,12 @@ def probe_plan_order_capability_on_startup(
     )
 
     if config.bitget.plan_orders_probe_safe_mode_on_failure:
-        runtime_state.enable_safe_mode("plan order capability unsupported")
         alerts.error(
             "PLAN_ORDER_FALLBACK",
-            "safe_mode enabled because plan order capability unsupported",
+            "safe_mode policy requested but safe_mode is disabled; alert-only",
             {
                 "reason": reason,
-                "safe_mode": True,
+                "safe_mode": False,
+                "alert_only": True,
             },
         )

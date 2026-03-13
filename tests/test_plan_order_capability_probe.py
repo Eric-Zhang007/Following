@@ -70,7 +70,7 @@ def test_probe_plan_orders_capability_handles_not_found_and_network_errors() -> 
     assert (state_param["expires_at"] - state_param["ts"]) <= 30
 
 
-def test_startup_probe_fallbacks_to_local_guard_and_safe_mode(tmp_path) -> None:
+def test_startup_probe_fallbacks_to_local_guard_with_alert_only(tmp_path) -> None:
     cfg = AppConfig.model_validate(
         {
             "dry_run": True,
@@ -127,7 +127,7 @@ def test_startup_probe_fallbacks_to_local_guard_and_safe_mode(tmp_path) -> None:
     )
 
     assert cfg.risk.stoploss.sl_order_type == "local_guard"
-    assert runtime_state.safe_mode is True
+    assert runtime_state.safe_mode is False
     row = store.conn.execute(
         "SELECT type FROM events WHERE type='PLAN_ORDER_FALLBACK' ORDER BY id DESC LIMIT 1"
     ).fetchone()

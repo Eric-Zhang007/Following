@@ -9,6 +9,7 @@ from trader.alerts import AlertManager
 from trader.bitget_client import BitgetClient
 from trader.config import AppConfig
 from trader.kill_switch import KillSwitch, KillSwitchAction
+from trader.side_mapper import close_side_for_hold
 from trader.state import OrderState, PositionState, StateStore, utc_now
 from trader.stoploss_manager import StopLossManager
 from trader.store import SQLiteStore
@@ -42,9 +43,12 @@ class RiskDaemon:
         )
         self.symbol_registry = symbol_registry
         self._api_error_burst_active = False
-        self._margin_used_high_active = False
+        self._kill_switch_safe_active = False
         self._sl_missing_active: set[str] = set()
         self._protection_retry_after: dict[str, float] = {}
+        self._tp_retry_after: dict[str, float] = {}
+        self._no_sl_loss_alert_active: set[str] = set()
+        self._no_sl_loss_alert_seq: dict[str, int] = {}
 
     async def run(self, stop_event: asyncio.Event) -> None:
         interval = self.config.monitor.poll_intervals.risk_daemon_seconds
@@ -68,25 +72,42 @@ class RiskDaemon:
         # local_guard stop-loss processing is part of SL reliability guarantees.
         self.stoploss_manager.process_local_guards()
 
+        no_sl_alert_seen_keys: set[str] = set()
         for position in list(self.state.positions.values()):
             await self._ensure_tracked_position_protection(position)
             await self._check_position_invariants(position)
+            alert_key = self._check_no_sl_loss_alert(position)
+            if alert_key is not None:
+                no_sl_alert_seen_keys.add(alert_key)
+
+        stale_keys = set(self._no_sl_loss_alert_seq.keys()) - no_sl_alert_seen_keys
+        for key in stale_keys:
+            self._no_sl_loss_alert_active.discard(key)
+            self._no_sl_loss_alert_seq.pop(key, None)
 
         self.state.recompute_sl_coverage_metric()
 
     def _apply_kill_switch(self) -> None:
         action = self.kill_switch.read_action()
         if action == KillSwitchAction.NONE:
+            if self._kill_switch_safe_active:
+                self.alerts.info(
+                    "KILL_SWITCH_RECOVERED",
+                    "kill switch SAFE_MODE request cleared",
+                    {"purpose": "risk_control", "reason": "manual_safe_mode_cleared"},
+                )
+                self._kill_switch_safe_active = False
             return
         if action == KillSwitchAction.SAFE_MODE:
-            if not self.state.safe_mode:
-                self.state.enable_safe_mode("kill switch SAFE_MODE")
+            if not self._kill_switch_safe_active:
                 self.alerts.critical(
                     "KILL_SWITCH",
-                    "kill switch activated SAFE_MODE",
-                    {"purpose": "risk_control", "reason": "manual_safe_mode"},
+                    "kill switch SAFE_MODE requested (alert-only; safe_mode disabled)",
+                    {"purpose": "risk_control", "reason": "manual_safe_mode_alert_only"},
                 )
+                self._kill_switch_safe_active = True
             return
+        self._kill_switch_safe_active = False
 
         if not self.state.panic_mode:
             self.state.enable_panic_mode("kill switch PANIC_CLOSE")
@@ -100,7 +121,6 @@ class RiskDaemon:
         cb = self.config.risk.circuit_breaker
         count = self.state.api_errors_in_window(cb.api_error_window_seconds)
         if count >= cb.api_error_burst:
-            self.state.enable_safe_mode("api error burst exceeded")
             if not self._api_error_burst_active:
                 self.alerts.error(
                     "API_ERROR_BURST",
@@ -136,7 +156,6 @@ class RiskDaemon:
         if self.state.peak_equity and self.state.peak_equity > 0:
             drawdown = (self.state.peak_equity - account.equity) / self.state.peak_equity
             if drawdown > self.config.risk.max_account_drawdown_pct:
-                self.state.enable_safe_mode("drawdown circuit breaker")
                 self.alerts.error(
                     "DRAWDOWN_BREAKER",
                     "drawdown exceeded max threshold",
@@ -147,35 +166,6 @@ class RiskDaemon:
                         "max_account_drawdown_pct": self.config.risk.max_account_drawdown_pct,
                     },
                 )
-
-        if account.equity > 0:
-            margin_ratio = max(account.margin_used, 0.0) / account.equity
-            if margin_ratio > self.config.risk.max_total_margin_used_pct:
-                self.state.enable_safe_mode("margin used ratio too high")
-                if not self._margin_used_high_active:
-                    self.alerts.warn(
-                        "MARGIN_USED_HIGH",
-                        "margin used ratio above threshold",
-                        {
-                            "purpose": "risk_control",
-                            "reason": "margin_used_high",
-                            "margin_ratio": margin_ratio,
-                            "max_total_margin_used_pct": self.config.risk.max_total_margin_used_pct,
-                        },
-                    )
-                    self._margin_used_high_active = True
-            elif self._margin_used_high_active:
-                self.alerts.info(
-                    "MARGIN_USED_HIGH_RECOVERED",
-                    "margin used ratio recovered below threshold",
-                    {
-                        "purpose": "risk_control",
-                        "reason": "margin_used_high_recovered",
-                        "margin_ratio": margin_ratio,
-                        "max_total_margin_used_pct": self.config.risk.max_total_margin_used_pct,
-                    },
-                )
-                self._margin_used_high_active = False
 
     async def _check_position_invariants(self, position: PositionState) -> None:
         if self.config.risk.enabled and self._is_liq_too_close(position):
@@ -203,6 +193,10 @@ class RiskDaemon:
             reduced = await self._reduce_position_once(position, reason="liquidation_distance_too_close")
             if not reduced:
                 await self._protective_close(position, reason="liquidation_distance_too_close")
+            return
+
+        thread = self.store.get_latest_trade_thread_by_symbol(position.symbol, active_only=True)
+        if self._allow_no_stop_loss_for_thread(thread) and not self.state.has_valid_stop_loss(position.symbol, position.side):
             return
 
         require_sl = self.config.risk.stoploss.must_exist or self.config.risk.hard_invariants.require_stoploss
@@ -298,7 +292,6 @@ class RiskDaemon:
             and self.config.risk.stoploss.emergency_close_if_sl_place_fails
         ):
             await self._protective_close(position, reason="sl_autofix_failed_then_panic")
-            self.state.enable_safe_mode("SL placement failed and timeout reached")
             self.alerts.critical(
                 "SL_AUTOFIX_FAILED_THEN_PANIC",
                 "stoploss autofix failed beyond timeout; panic close triggered",
@@ -315,7 +308,7 @@ class RiskDaemon:
         qty = max(position.size * 0.5, 0.0)
         if qty <= 0:
             return False
-        close_side = "sell" if position.side.lower() == "long" else "buy"
+        close_side = close_side_for_hold(position.side, self.config.bitget.position_mode)
         trace = self.alerts.warn(
             "RISK_REDUCE_ATTEMPT",
             "trying risk-driven partial reduce before full close",
@@ -452,6 +445,7 @@ class RiskDaemon:
             return
 
         key = f"{position.symbol.upper()}::{position.side.lower()}"
+        tp_key = f"{key}::tp"
         now_ts = time.time()
         if now_ts < float(self._protection_retry_after.get(key, 0.0)):
             return
@@ -459,77 +453,185 @@ class RiskDaemon:
         trace_id: str | None = None
         sl_ready = self.state.has_valid_stop_loss(position.symbol, position.side)
         if not sl_ready:
-            result = self.stoploss_manager.ensure_stop_loss(
-                position_state=position,
-                desired_sl_price=thread.get("stop_loss"),
-                desired_size=position.size,
-                source="tracked_position_autoprotect",
-            )
-            trace_id = result.trace_id
-            self.store.record_reconciler_action(
-                symbol=position.symbol,
-                order_id=result.order_id,
-                client_order_id=result.client_order_id,
-                action="TRACKED_POSITION_ENSURE_SL",
-                reason=result.reason,
-                payload={"purpose": "sl", "thread_id": thread.get("thread_id"), "ok": result.ok, "mode": result.mode},
-                trace_id=result.trace_id,
-                thread_id=thread.get("thread_id"),
-                purpose="sl",
-            )
-            if not result.ok:
-                self._protection_retry_after[key] = now_ts + 15.0
-                return
+            if self._allow_no_stop_loss_for_thread(thread):
+                pass
+            else:
+                result = self.stoploss_manager.ensure_stop_loss(
+                    position_state=position,
+                    desired_sl_price=thread.get("stop_loss"),
+                    desired_size=position.size,
+                    source="tracked_position_autoprotect",
+                )
+                trace_id = result.trace_id
+                self.store.record_reconciler_action(
+                    symbol=position.symbol,
+                    order_id=result.order_id,
+                    client_order_id=result.client_order_id,
+                    action="TRACKED_POSITION_ENSURE_SL",
+                    reason=result.reason,
+                    payload={"purpose": "sl", "thread_id": thread.get("thread_id"), "ok": result.ok, "mode": result.mode},
+                    trace_id=result.trace_id,
+                    thread_id=thread.get("thread_id"),
+                    purpose="sl",
+                )
+                if not result.ok:
+                    self._protection_retry_after[key] = now_ts + 15.0
+                    return
 
         if not self.config.execution.place_tp_on_fill:
             return
-        tp_points = [float(v) for v in thread.get("tp_points", []) if float(v) > 0]
+        thread_id = int(thread["thread_id"])
+        tp_points = self._remaining_tp_points(thread_id)
         if not tp_points:
             return
-        if self._has_active_tp(position, int(thread["thread_id"])):
+        tp_guard_key = f"tp_submit_guard::{position.symbol.upper()}::{position.side.lower()}::{thread_id}"
+        last_tp_submit = self.store.get_system_flag(tp_guard_key)
+        if last_tp_submit is not None:
+            try:
+                if now_ts - float(last_tp_submit) < 120.0:
+                    return
+            except Exception:  # noqa: BLE001
+                pass
+        if now_ts < float(self._tp_retry_after.get(tp_key, 0.0)):
+            return
+        if self._has_active_tp(position, thread_id, tp_points=tp_points):
+            self.store.set_system_flag(tp_guard_key, str(now_ts))
+            self._tp_retry_after[tp_key] = now_ts + 60.0
             return
         ok = self._place_tp_for_tracked_position(
             symbol=position.symbol,
             side_hint=thread.get("side"),
             total_size=position.size,
-            thread_id=int(thread["thread_id"]),
+            thread_id=thread_id,
             tp_points=tp_points,
             parent_client_order_id=None,
         )
         if not ok:
+            self._tp_retry_after[tp_key] = now_ts + 15.0
             self._protection_retry_after[key] = now_ts + 15.0
             return
+        self.store.set_system_flag(tp_guard_key, str(now_ts))
+        self._tp_retry_after[tp_key] = now_ts + 120.0
         self._protection_retry_after.pop(key, None)
 
-    def _has_active_tp(self, position: PositionState, thread_id: int) -> bool:
+    def _allow_no_stop_loss_for_thread(self, thread: dict | None) -> bool:
+        if thread is None:
+            return False
+        if not self.config.risk.allow_entry_without_stop_loss:
+            return False
+        return thread.get("stop_loss") in {None, ""}
+
+    def _check_no_sl_loss_alert(self, position: PositionState) -> str | None:
+        thread = self.store.get_latest_trade_thread_by_symbol(position.symbol, active_only=True)
+        if not self._allow_no_stop_loss_for_thread(thread):
+            return None
+        if self.state.has_valid_stop_loss(position.symbol, position.side):
+            return None
+
+        entry = float(position.entry_price or 0.0)
+        mark = float(position.mark_price or 0.0)
+        if entry <= 0 or mark <= 0:
+            return None
+
+        side = str(position.side or "").lower()
+        if side == "short":
+            loss_ratio = max((mark - entry) / entry, 0.0)
+        else:
+            loss_ratio = max((entry - mark) / entry, 0.0)
+
+        threshold = float(self.config.risk.no_stop_loss_loss_alert_pct)
+        thread_id = int(thread.get("thread_id")) if thread and thread.get("thread_id") is not None else 0
+        key = f"{position.symbol.upper()}::{side}::{thread_id}"
+        if loss_ratio >= threshold:
+            if key not in self._no_sl_loss_alert_active:
+                seq = int(self._no_sl_loss_alert_seq.get(key, 0)) + 1
+                self._no_sl_loss_alert_seq[key] = seq
+                self._no_sl_loss_alert_active.add(key)
+                self.alerts.error(
+                    "NO_SL_DRAWDOWN_20",
+                    "position without stop-loss exceeded configured loss threshold",
+                    {
+                        "symbol": position.symbol,
+                        "side": side,
+                        "thread_id": thread_id,
+                        "entry_price": entry,
+                        "mark_price": mark,
+                        "position_size": position.size,
+                        "loss_pct": round(loss_ratio * 100.0, 4),
+                        "threshold_pct": round(threshold * 100.0, 4),
+                        "cross_seq": seq,
+                        "purpose": "risk_control",
+                        "reason": "no_stop_loss_drawdown_threshold",
+                    },
+                )
+        elif key in self._no_sl_loss_alert_active:
+            self._no_sl_loss_alert_active.discard(key)
+        return key
+
+    def _remaining_tp_points(self, thread_id: int) -> list[float]:
+        for order in self.state.all_orders():
+            if order.thread_id != thread_id:
+                continue
+            if order.purpose.lower() != "tp":
+                continue
+            if order.status.upper() != "FILLED":
+                continue
+            if order.trigger_price is None:
+                continue
+            self.store.mark_tp_point_filled(thread_id=thread_id, tp_price=float(order.trigger_price))
+        return self.store.get_remaining_tp_points(thread_id)
+
+    def _has_active_tp(self, position: PositionState, thread_id: int, *, tp_points: list[float] | None = None) -> bool:
         symbol = position.symbol
-        expected_close_side = "sell" if position.side.lower() == "long" else "buy"
+        expected_close_side = close_side_for_hold(position.side, self.config.bitget.position_mode)
         entry_price = float(position.entry_price) if position.entry_price not in {None, 0} else None
+        remaining_tp_points = [float(v) for v in (tp_points if tp_points is not None else self._remaining_tp_points(thread_id))]
         for order in self.state.all_orders():
             if order.symbol.upper() != symbol.upper():
                 continue
-            if order.status.upper() in {"CANCELED", "FAILED", "REJECTED"}:
+            if order.status.upper() in {"CANCELED", "FAILED", "REJECTED", "FILLED"}:
                 continue
+            is_close_order = bool(order.reduce_only) or (order.trade_side or "").lower() == "close"
+            if not is_close_order:
+                continue
+            if order.side.lower() != expected_close_side:
+                continue
+
             if order.thread_id == thread_id and order.purpose.lower() == "tp":
-                return True
-            if not order.is_plan_order:
+                if order.trigger_price is None:
+                    return True
+                trigger_price = float(order.trigger_price)
+                if not remaining_tp_points:
+                    continue
+                if any(abs(trigger_price - p) <= max(1e-9, abs(p) * 1e-6) for p in remaining_tp_points):
+                    return True
                 continue
+
             purpose = (order.purpose or "").lower()
             client_oid = (order.client_order_id or "").lower()
             if purpose == "sl" or client_oid.startswith("sl-"):
                 continue
             if client_oid.startswith("tp-"):
+                if order.trigger_price is None:
+                    return True
+                trigger_price = float(order.trigger_price)
+                if remaining_tp_points and any(abs(trigger_price - p) <= max(1e-9, abs(p) * 1e-6) for p in remaining_tp_points):
+                    return True
+                if remaining_tp_points:
+                    continue
                 return True
-            if order.side.lower() != expected_close_side:
-                continue
-            if not order.reduce_only and (order.trade_side or "").lower() != "close":
+            if not order.is_plan_order:
                 continue
             if entry_price is None or order.trigger_price is None:
                 continue
             trigger_price = float(order.trigger_price)
-            if expected_close_side == "sell" and trigger_price > entry_price:
+            if remaining_tp_points and any(abs(trigger_price - p) <= max(1e-9, abs(p) * 1e-6) for p in remaining_tp_points):
                 return True
-            if expected_close_side == "buy" and trigger_price < entry_price:
+            if remaining_tp_points:
+                continue
+            if position.side.lower() == "long" and trigger_price > entry_price:
+                return True
+            if position.side.lower() == "short" and trigger_price < entry_price:
                 return True
         return False
 
@@ -546,10 +648,10 @@ class RiskDaemon:
         if total_size <= 0 or not tp_points:
             return False
 
-        side = "sell" if str(side_hint or "LONG").upper() == "LONG" else "buy"
+        hold_side = "long" if str(side_hint or "LONG").upper() == "LONG" else "short"
+        side = close_side_for_hold(hold_side, self.config.bitget.position_mode)
         trade_side = "close" if self.config.bitget.position_mode == "hedge_mode" else None
         reduce_only = self.config.bitget.position_mode == "one_way_mode"
-        hold_side = "long" if side == "sell" else "short"
         remaining_size = total_size
         placed = 0
         failed = 0

@@ -61,7 +61,7 @@ def _config() -> AppConfig:
     )
 
 
-def test_ws_failure_falls_back_to_rest_and_enables_safe_mode(tmp_path) -> None:
+def test_ws_failure_falls_back_to_rest_alert_only(tmp_path) -> None:
     config = _config()
     store = SQLiteStore(str(tmp_path / "ws_fallback.db"))
     alerts = AlertManager(Notifier(logging.getLogger("test")), store, logging.getLogger("test"))
@@ -84,7 +84,7 @@ def test_ws_failure_falls_back_to_rest_and_enables_safe_mode(tmp_path) -> None:
     asyncio.run(feed.run(stop_event))
 
     assert called["rest"] == 1
-    assert state.safe_mode is True
+    assert state.safe_mode is False
 
     row = store.conn.execute(
         "SELECT type FROM events WHERE type='PRICE_FEED_LOCAL_GUARD_DEGRADED' ORDER BY id DESC LIMIT 1"

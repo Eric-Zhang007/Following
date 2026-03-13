@@ -9,7 +9,7 @@ from typing import Any
 import requests
 
 from trader.config import VLMConfig
-from trader.vlm_schema import VLMParsedSignal
+from trader.vlm_schema import VLMParsedSignal, get_vlm_json_schema
 
 _SYSTEM_PROMPT = """You are a strict trading-signal extractor.
 Return JSON only, no prose.
@@ -27,7 +27,10 @@ Hard constraints:
 5) safety.should_trade must be exactly "NO_DECISION".
 6) If uncertain_fields is non-empty OR any critical field missing, confidence must be <= 0.6.
 7) Evidence snippets must be short direct quotes (<=30 chars) from text/image.
+8) For MANAGE_ACTION reduce/partial-close without explicit numeric percent, set manage.reduce_pct=35.
+9) For explicit full-close intent (e.g. 全平/close all), set manage.reduce_pct=100 and add_pct=null.
 """
+_VLM_SCHEMA_JSON_TEXT = json.dumps(get_vlm_json_schema(), ensure_ascii=False)
 
 
 class VLMClient:
@@ -47,13 +50,34 @@ class VLMClient:
         )
 
     def extract(self, image_bytes: bytes | None, text_context: str) -> VLMParsedSignal:
-        payload = self._build_payload(image_bytes=image_bytes, text_context=text_context)
-        raw = self._request_with_retries(payload)
-        parsed_json = self._extract_json(raw)
-        return VLMParsedSignal.model_validate(parsed_json)
+        last_error: Exception | None = None
+        for schema_attempt in range(2):
+            payload = self._build_payload(
+                image_bytes=image_bytes,
+                text_context=text_context,
+                schema_retry=schema_attempt > 0,
+            )
+            raw = self._request_with_retries(payload)
+            parsed_json = self._extract_json(raw)
+            try:
+                return VLMParsedSignal.model_validate(parsed_json)
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                if schema_attempt == 0:
+                    continue
+        raise RuntimeError(f"VLM schema validation failed after one retry: {last_error}")
 
-    def _build_payload(self, image_bytes: bytes | None, text_context: str) -> dict[str, Any]:
-        content: list[dict[str, Any]] = [{"type": "text", "text": text_context or ""}]
+    def _build_payload(self, image_bytes: bytes | None, text_context: str, schema_retry: bool = False) -> dict[str, Any]:
+        schema_hint = (
+            "Follow JSON schema exactly (no extra keys):\n"
+            f"{_VLM_SCHEMA_JSON_TEXT}\n"
+        )
+        if schema_retry:
+            schema_hint = (
+                "Previous output violated schema. Fix it and return strictly valid JSON.\n"
+                + schema_hint
+            )
+        content: list[dict[str, Any]] = [{"type": "text", "text": f"{schema_hint}\nContext:\n{text_context or ''}"}]
         if image_bytes is not None:
             b64 = base64.b64encode(image_bytes).decode("utf-8")
             content.append(

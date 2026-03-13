@@ -174,10 +174,9 @@ class PriceFeed:
             "action": action,
         }
         if action == "safe_mode":
-            self.state.enable_safe_mode("ws fallback to rest while using local_guard stop-loss")
             self.alerts.error(
                 "PRICE_FEED_LOCAL_GUARD_DEGRADED",
-                "ws fallback to rest in local_guard mode; safe_mode enabled",
+                "ws fallback to rest in local_guard mode; safe_mode disabled so alert-only",
                 payload,
             )
             return

@@ -106,7 +106,7 @@ def test_sl_autofix_failures_timeout_then_panic_close(tmp_path) -> None:
     asyncio.run(daemon.tick_once())
 
     assert bitget.close_calls == 1
-    assert state.safe_mode is True
+    assert state.safe_mode is False
 
     event = store.conn.execute(
         "SELECT type FROM events WHERE type='SL_AUTOFIX_FAILED_THEN_PANIC' ORDER BY id DESC LIMIT 1"

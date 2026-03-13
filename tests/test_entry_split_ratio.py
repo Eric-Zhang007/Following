@@ -61,7 +61,7 @@ def _config() -> AppConfig:
     )
 
 
-def test_two_entry_split_ratio_keeps_post_order(tmp_path) -> None:
+def test_two_entry_points_each_use_full_margin_notional(tmp_path) -> None:
     store = SQLiteStore(str(tmp_path / "split.db"))
     state = StateStore()
     contract = ContractInfo(symbol="PEPEUSDT", size_place=6, price_place=8, min_trade_num=0.0, raw={})
@@ -101,12 +101,15 @@ def test_two_entry_split_ratio_keeps_post_order(tmp_path) -> None:
     assert i1["entry_points"] == [10.0, 8.0]
     assert i0["entry_index"] == 0
     assert i1["entry_index"] == 1
-    assert i0["quantity"] < i1["quantity"]
+    notional0 = float(i0["quantity"]) * float(i0["price"])
+    notional1 = float(i1["quantity"]) * float(i1["price"])
+    assert abs(notional0 - 300.0) < 1e-4
+    assert abs(notional1 - 300.0) < 1e-4
     assert i0["price"] == 10.0
     assert i1["price"] == 8.0
 
 
-def test_major_or_high_leverage_prefers_even_split(tmp_path) -> None:
+def test_high_leverage_two_entry_points_keep_equal_notional_per_point(tmp_path) -> None:
     store = SQLiteStore(str(tmp_path / "split_major.db"))
     state = StateStore()
     contract = ContractInfo(symbol="BTCUSDT", size_place=6, price_place=2, min_trade_num=0.0, raw={})
@@ -143,15 +146,13 @@ def test_major_or_high_leverage_prefers_even_split(tmp_path) -> None:
     i0 = json.loads(rows[0]["intent_json"])
     i1 = json.loads(rows[1]["intent_json"])
 
-    q0 = float(i0["quantity"])
-    q1 = float(i1["quantity"])
-    assert q0 > 0
-    assert q1 > 0
-    # High leverage path should use an even split (allow tiny rounding diff).
-    assert abs(q0 - q1) / max(q0, q1) < 0.03
+    notional0 = float(i0["quantity"]) * float(i0["price"])
+    notional1 = float(i1["quantity"]) * float(i1["price"])
+    assert abs(notional0 - 1800.0) < 0.05
+    assert abs(notional1 - 1800.0) < 0.05
 
 
-def test_thread_entry_respects_risk_notional_cap(tmp_path) -> None:
+def test_thread_entry_ignores_risk_notional_cap_and_keeps_margin_sizing(tmp_path) -> None:
     store = SQLiteStore(str(tmp_path / "split_cap.db"))
     state = StateStore()
     contract = ContractInfo(symbol="BTCUSDT", size_place=6, price_place=2, min_trade_num=0.0, raw={})
@@ -178,8 +179,8 @@ def test_thread_entry_respects_risk_notional_cap(tmp_path) -> None:
         stop_loss=59000.0,
         tp_points=[64000.0, 66000.0],
     )
-    # per_trade_margin_usdt=30 and leverage=50 would imply notional=1500,
-    # but risk cap below should clamp to 300.
+    # per_trade_margin_usdt=30 and leverage=50 implies notional=1500 per entry.
+    # risk_decision.notional no longer clamps executor sizing.
     decision = RiskDecision(approved=True, notional=300.0)
     result = executor.execute_thread_entry(
         signal,
@@ -196,8 +197,12 @@ def test_thread_entry_respects_risk_notional_cap(tmp_path) -> None:
     assert len(rows) == 2
     i0 = json.loads(rows[0]["intent_json"])
     i1 = json.loads(rows[1]["intent_json"])
-    total_notional = float(i0["quantity"]) * float(i0["price"]) + float(i1["quantity"]) * float(i1["price"])
-    assert total_notional < 350.0
+    n0 = float(i0["quantity"]) * float(i0["price"])
+    n1 = float(i1["quantity"]) * float(i1["price"])
+    total_notional = n0 + n1
+    assert abs(n0 - 1500.0) < 0.1
+    assert abs(n1 - 1500.0) < 0.1
+    assert abs(total_notional - 3000.0) < 0.2
 
 
 def test_market_entry_without_numeric_range_uses_risk_anchor(tmp_path) -> None:

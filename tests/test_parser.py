@@ -64,6 +64,27 @@ def test_parse_manage_add_with_default_pct() -> None:
     assert parsed.reduce_pct is None
 
 
+def test_parse_manage_exit_addon_phrase_prefers_reduce() -> None:
+    parser = SignalParser()
+    msg = "#CYBER/USDT 減掉補倉"
+    parsed = parser.parse(msg, source_key="c1")
+
+    assert isinstance(parsed, ManageAction)
+    assert parsed.symbol == "CYBERUSDT"
+    assert parsed.reduce_pct == 35
+    assert parsed.add_pct is None
+
+
+def test_parse_manage_reduce_without_pct_defaults_to_35() -> None:
+    parser = SignalParser()
+    msg = "#CYBER/USDT 减仓"
+    parsed = parser.parse(msg, source_key="c1")
+
+    assert isinstance(parsed, ManageAction)
+    assert parsed.symbol == "CYBERUSDT"
+    assert parsed.reduce_pct == 35
+
+
 def test_parse_manage_move_be_with_state_machine() -> None:
     parser = SignalParser()
     entry = "#SOL/USDT（20x做多） 进场：限价100-102"

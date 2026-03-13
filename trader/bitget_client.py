@@ -5,7 +5,7 @@ import hashlib
 import hmac
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlencode
 
@@ -13,6 +13,7 @@ import requests
 
 from trader.config import BitgetConfig
 from trader.models import OrderAck
+from trader.side_mapper import close_side_for_hold
 from trader.rate_limiter import TokenBucketRateLimiter, exponential_backoff_seconds
 
 
@@ -225,6 +226,35 @@ class BitgetClient:
         if side_upper == "SHORT":
             return any(float(item["high"]) >= stop_loss for item in candles)
         raise ValueError(f"unsupported side: {side}")
+
+    def get_reference_price_at(
+        self,
+        *,
+        symbol: str,
+        at_time: datetime,
+        granularity: str = "1m",
+        lookback_minutes: int = 10,
+        lookahead_minutes: int = 2,
+    ) -> float | None:
+        ref = at_time
+        if ref.tzinfo is None:
+            ref = ref.replace(tzinfo=timezone.utc)
+        start = ref - timedelta(minutes=max(1, lookback_minutes))
+        end = ref + timedelta(minutes=max(0, lookahead_minutes))
+        candles = self.get_history_candles(
+            symbol=symbol,
+            start_time=start,
+            end_time=end,
+            granularity=granularity,
+        )
+        if not candles:
+            return None
+
+        target_ts = int(ref.timestamp() * 1000)
+        prior = [c for c in candles if int(c.get("ts", 0)) <= target_ts]
+        pick = prior[-1] if prior else min(candles, key=lambda c: abs(int(c.get("ts", 0)) - target_ts))
+        close_px = float(pick.get("close") or 0.0)
+        return close_px if close_px > 0 else None
 
     def get_account_equity(self) -> float:
         data = self._request(
@@ -635,7 +665,7 @@ class BitgetClient:
         return self._float(payload, ["fundingRate", "fundRate", "currentFundRate"])
 
     def protective_close_position(self, symbol: str, side: str, size: float) -> dict[str, Any]:
-        close_side = "sell" if side.lower() == "long" else "buy"
+        close_side = close_side_for_hold(side, self.config.position_mode)
         return self.place_order(
             symbol=symbol,
             side=close_side,

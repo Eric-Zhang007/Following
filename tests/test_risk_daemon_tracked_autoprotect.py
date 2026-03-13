@@ -243,7 +243,7 @@ def test_tracked_position_autoprotect_skips_when_manual_tp_exists(tmp_path) -> N
             quantity=1000.0,
             avg_price=None,
             reduce_only=True,
-            trade_side="close",
+            trade_side=None,
             purpose="sl",
             timestamp=utc_now(),
             client_order_id="manual-sl-1",
@@ -262,7 +262,7 @@ def test_tracked_position_autoprotect_skips_when_manual_tp_exists(tmp_path) -> N
             quantity=500.0,
             avg_price=None,
             reduce_only=True,
-            trade_side="close",
+            trade_side=None,
             purpose="tp",
             timestamp=utc_now(),
             client_order_id="tp-manual-1",
@@ -329,7 +329,7 @@ def test_tracked_position_autoprotect_sl_above_entry_does_not_block_tp(tmp_path)
             quantity=1000.0,
             avg_price=None,
             reduce_only=True,
-            trade_side="close",
+            trade_side=None,
             purpose="sl",
             timestamp=utc_now(),
             client_order_id="sl-manual-2",
@@ -351,3 +351,117 @@ def test_tracked_position_autoprotect_sl_above_entry_does_not_block_tp(tmp_path)
     asyncio.run(daemon.tick_once())
 
     assert bitget.tp_calls == 3
+
+
+def test_state_close_purpose_can_be_used_as_stoploss_when_below_entry(tmp_path) -> None:
+    store = SQLiteStore(str(tmp_path / "state_close_as_sl.db"))
+    alerts = AlertManager(Notifier(logging.getLogger("test")), store, logging.getLogger("test"))
+    state = StateStore()
+    state.set_account(equity=1000, available=900, margin_used=100)
+    state.set_positions(
+        [
+            PositionState(
+                symbol="INXUSDT",
+                side="long",
+                size=1000.0,
+                entry_price=0.1,
+                mark_price=0.1,
+                liq_price=0.05,
+                pnl=0.0,
+                leverage=10,
+                margin_mode="isolated",
+                timestamp=utc_now(),
+                opened_at=utc_now(),
+                unknown_origin=False,
+            )
+        ]
+    )
+    state.upsert_order(
+        OrderState(
+            symbol="INXUSDT",
+            side="sell",
+            status="NEW",
+            filled=0.0,
+            quantity=1000.0,
+            avg_price=None,
+            reduce_only=True,
+            trade_side=None,
+            purpose="close",
+            timestamp=utc_now(),
+            client_order_id="manual-close-sl-1",
+            order_id="manual-close-sl-1",
+            trigger_price=0.0865,
+            is_plan_order=True,
+            thread_id=99,
+        )
+    )
+
+    assert state.has_valid_stop_loss("INXUSDT", "long") is True
+
+
+def test_filled_tp_only_rearms_remaining_targets(tmp_path) -> None:
+    store = SQLiteStore(str(tmp_path / "tracked_autoprotect_filled_tp.db"))
+    alerts = AlertManager(Notifier(logging.getLogger("test")), store, logging.getLogger("test"))
+    state = StateStore()
+    state.set_account(equity=1000, available=900, margin_used=100)
+    state.set_positions(
+        [
+            PositionState(
+                symbol="INXUSDT",
+                side="long",
+                size=650.0,
+                entry_price=0.1,
+                mark_price=0.1,
+                liq_price=0.05,
+                pnl=0.0,
+                leverage=10,
+                margin_mode="isolated",
+                timestamp=utc_now(),
+                opened_at=utc_now(),
+                unknown_origin=False,
+            )
+        ]
+    )
+    store.upsert_trade_thread(
+        thread_id=18,
+        symbol="INXUSDT",
+        side="LONG",
+        leverage=10,
+        stop_loss=0.0865,
+        tp_points=[0.15, 0.18, 0.2],
+        status="ACTIVE",
+    )
+    store.mark_tp_point_filled(thread_id=18, tp_price=0.15)
+    state.upsert_order(
+        OrderState(
+            symbol="INXUSDT",
+            side="sell",
+            status="FILLED",
+            filled=350.0,
+            quantity=350.0,
+            avg_price=0.15,
+            reduce_only=True,
+            trade_side=None,
+            purpose="tp",
+            timestamp=utc_now(),
+            client_order_id="tp-old-filled",
+            order_id="tp-old-filled",
+            trigger_price=0.15,
+            is_plan_order=True,
+            thread_id=18,
+        )
+    )
+
+    bitget = FakeBitgetTrackedProtect()
+    daemon = RiskDaemon(
+        config=_config(),
+        bitget=bitget,
+        state=state,
+        store=store,
+        alerts=alerts,
+        kill_switch=KillSwitch(store=store, file_path=str(tmp_path / "NO_SWITCH")),
+    )
+    asyncio.run(daemon.tick_once())
+
+    assert bitget.tp_calls == 2
+    assert bitget.tp_sizes == [325.0, 325.0]

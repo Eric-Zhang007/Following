@@ -19,12 +19,22 @@ _SYMBOL_HASH_RE = re.compile(r"#\s*([A-Za-z0-9]{1,20})(?:\s*/\s*(USDT))?", re.IG
 _SYMBOL_PAIR_RE = re.compile(r"([A-Za-z0-9]{1,20})\s*/\s*USDT", re.IGNORECASE)
 _LEVERAGE_RE = re.compile(r"(\d{1,3})\s*[xX]\s*做?\s*(多|空)?", re.IGNORECASE)
 _SIDE_RE = re.compile(r"(做多|做空|LONG|SHORT)", re.IGNORECASE)
-_ENTRY_LINE_RE = re.compile(r"(?:進場位|进场位|入場位|入场位|進場|进场)\s*[:：]?\s*([^\n\r]+)", re.IGNORECASE)
+_ENTRY_LINE_RE = re.compile(r"(?:進場位|进场位|入場位|入场位|進場|进场)\s*[:：]\s*([^\n\r]+)", re.IGNORECASE)
 _TP_LINE_RE = re.compile(r"(?:盈利位|止盈位|盈利|止盈)\s*[:：]?\s*([^\n\r]+)", re.IGNORECASE)
 _SL_LINE_RE = re.compile(r"(?:止損位|止损位|止損|止损|SL)\s*[:：]?\s*([0-9]*\.?[0-9]+)", re.IGNORECASE)
 _MARKET_RE = re.compile(r"(?:市价|市價|market)", re.IGNORECASE)
-_REDUCE_RE = re.compile(r"(?:减仓|減倉|平仓|平倉)\s*(\d{1,3})(?:\s*[%％])?", re.IGNORECASE)
+_INLINE_MARKET_ENTRY_RE = re.compile(
+    r"(?:市价|市價|market)\s*([0-9]*\.?[0-9]+)\s*(?:附近|左右|一带|一帶)?\s*(做多|做空|多|空|LONG|SHORT)?",
+    re.IGNORECASE,
+)
+_REDUCE_RE = re.compile(r"(?:减仓|減倉|平仓|平倉)\s*(\d{1,3})?(?:\s*[%％])?", re.IGNORECASE)
 _ADD_RE = re.compile(r"(?:补仓|補倉|加仓|加倉|加碼)\s*(\d{1,3})?(?:\s*[%％])?", re.IGNORECASE)
+_EXIT_ADDON_RE = re.compile(r"(?:减掉\s*补仓|減掉\s*補倉|减掉\s*補倉|減掉\s*补仓|出\s*补仓|出\s*補倉)", re.IGNORECASE)
+_FULL_CLOSE_RE = re.compile(
+    r"(?:市价止盈|市價止盈|市价止损|市價止損|全平|全部平仓|全部平倉|清仓|清倉|平仓出局|平倉出局|close\s*all)",
+    re.IGNORECASE,
+)
+_DEFAULT_REDUCE_PCT = 35.0
 
 
 @dataclass
@@ -76,7 +86,7 @@ class PrivateChannelParser:
                     manage.symbol = fallback_symbol
                 return PrivateParseOutcome(parsed=manage, parse_source="RULES_PRIVATE", confidence=1.0)
             if image_path and self._vlm is not None:
-                vlm = self._parse_entry_with_vlm(
+                vlm = self._parse_with_vlm(
                     text=normalized,
                     timestamp=timestamp,
                     image_path=image_path,
@@ -123,6 +133,37 @@ class PrivateChannelParser:
             confidence=1.0,
         )
 
+    def recover_from_non_signal(
+        self,
+        *,
+        text: str,
+        timestamp: datetime | None,
+        image_path: str | None,
+        fallback_symbol: str | None,
+        thread_id: int | None,
+    ) -> PrivateParseOutcome | None:
+        normalized = self._normalize(text)
+        if image_path and self._vlm is not None:
+            vlm = self._parse_with_vlm(
+                text=normalized,
+                timestamp=timestamp,
+                image_path=image_path,
+                fallback_symbol=fallback_symbol,
+                thread_id=thread_id,
+            )
+            if vlm is not None and isinstance(vlm.parsed, (EntrySignal, ManageAction)):
+                return vlm
+
+        llm = self._parse_with_llm(
+            text=normalized,
+            timestamp=timestamp,
+            fallback_symbol=fallback_symbol,
+            thread_id=thread_id,
+        )
+        if llm is not None and isinstance(llm.parsed, (EntrySignal, ManageAction)):
+            return llm
+        return None
+
     def _parse_entry(
         self,
         text: str,
@@ -134,7 +175,14 @@ class PrivateChannelParser:
         side = self._extract_side(text)
         leverage = self._extract_leverage(text)
         entry_type = EntryType.MARKET if self._is_market_entry(text) else EntryType.LIMIT
+        inline_anchor_price, inline_side = self._extract_inline_market_anchor_and_side(text)
+        if inline_anchor_price is not None:
+            entry_type = EntryType.MARKET
         entry_points = self._extract_price_points(_ENTRY_LINE_RE, text)
+        if not entry_points and inline_anchor_price is not None:
+            entry_points = [inline_anchor_price]
+        if side is None and inline_side is not None:
+            side = inline_side
         tp_points = self._extract_price_points(_TP_LINE_RE, text)
         sl_price = self._extract_stop_loss(text)
 
@@ -180,7 +228,7 @@ class PrivateChannelParser:
             [],
         )
 
-    def _parse_entry_with_vlm(
+    def _parse_with_vlm(
         self,
         *,
         text: str,
@@ -203,49 +251,33 @@ class PrivateChannelParser:
         if not isinstance(field_evidence, dict):
             field_evidence = {}
 
-        required = [
-            "symbol",
-            "side",
-            "entry.low",
-            "entry.high",
-            "entry.tp",
-            "entry.stop_loss",
-            "leverage",
-        ]
-        missing = [fp for fp in required if not self._has_field_evidence(field_evidence, fp)]
-        if missing:
-            return PrivateParseOutcome(
-                parsed=NeedsManual(
-                    kind=ParsedKind.NEEDS_MANUAL,
-                    raw_text=text,
-                    reason="vlm_missing_evidence",
-                    missing_fields=missing,
-                    timestamp=timestamp,
-                ),
-                parse_source="VLM_PRIVATE_NEEDS_MANUAL",
-                confidence=0.0,
-                llm_payload=payload,
-            )
-
         signal = parsed.to_parsed_message(text, timestamp=timestamp, fallback_symbol=fallback_symbol)
-        if not isinstance(signal, EntrySignal):
-            return PrivateParseOutcome(
-                parsed=NeedsManual(
-                    kind=ParsedKind.NEEDS_MANUAL,
-                    raw_text=text,
-                    reason="vlm_not_entry_signal",
-                    missing_fields=["entry_signal"],
-                    timestamp=timestamp,
-                ),
-                parse_source="VLM_PRIVATE_NEEDS_MANUAL",
-                confidence=0.0,
-                llm_payload=payload,
-            )
-        signal.thread_id = thread_id
-        if not signal.entry_points:
-            signal.entry_points = [signal.entry_low, signal.entry_high] if signal.entry_low != signal.entry_high else [signal.entry_low]
-        if not signal.tp_points:
-            signal.tp_points = list(signal.take_profit)
+        if isinstance(signal, EntrySignal):
+            required = ["symbol", "side", "entry.low", "entry.high", "leverage"]
+            missing = [fp for fp in required if not self._has_field_evidence(field_evidence, fp)]
+            if missing:
+                return PrivateParseOutcome(
+                    parsed=NeedsManual(
+                        kind=ParsedKind.NEEDS_MANUAL,
+                        raw_text=text,
+                        reason="vlm_missing_evidence",
+                        missing_fields=missing,
+                        timestamp=timestamp,
+                    ),
+                    parse_source="VLM_PRIVATE_NEEDS_MANUAL",
+                    confidence=0.0,
+                    llm_payload=payload,
+                )
+            signal.thread_id = thread_id
+            if not signal.entry_points:
+                signal.entry_points = [signal.entry_low, signal.entry_high] if signal.entry_low != signal.entry_high else [signal.entry_low]
+            if not signal.tp_points:
+                signal.tp_points = list(signal.take_profit)
+        elif isinstance(signal, ManageAction):
+            signal.thread_id = thread_id
+            self._normalize_manage_defaults(signal, text)
+        else:
+            return None
         return PrivateParseOutcome(
             parsed=signal,
             parse_source="VLM_PRIVATE",
@@ -264,15 +296,22 @@ class PrivateChannelParser:
         if self._llm is None:
             return None
         sanitized = sanitize_text(text, self.config.llm.redact_patterns)
-        try:
-            payload = self._llm.parse_signal(sanitized)
-            validated = LLMParsedOutput.model_validate(payload)
-        except Exception:
+        validated: LLMParsedOutput | None = None
+        for _ in range(2):
+            try:
+                payload = self._llm.parse_signal(sanitized)
+                validated = LLMParsedOutput.model_validate(payload)
+                break
+            except Exception:
+                continue
+        if validated is None:
             return None
         parsed = validated.to_parsed_message(text, timestamp=timestamp, fallback_symbol=fallback_symbol)
         if isinstance(parsed, (EntrySignal, ManageAction)):
             if hasattr(parsed, "thread_id"):
                 parsed.thread_id = thread_id
+            if isinstance(parsed, ManageAction):
+                self._normalize_manage_defaults(parsed, text)
             return PrivateParseOutcome(
                 parsed=parsed,
                 parse_source="LLM_PRIVATE",
@@ -284,10 +323,20 @@ class PrivateChannelParser:
 
     def _parse_manage(self, text: str, *, timestamp: datetime | None, thread_id: int | None) -> ManageAction | None:
         reduce_match = _REDUCE_RE.search(text)
-        reduce_pct = float(reduce_match.group(1)) if reduce_match else None
+        reduce_pct: float | None = None
+        if reduce_match:
+            raw_reduce = reduce_match.group(1)
+            reduce_pct = float(raw_reduce) if raw_reduce else _DEFAULT_REDUCE_PCT
+        exit_addon = _EXIT_ADDON_RE.search(text) is not None
+        if reduce_pct is None and exit_addon:
+            # Phrases like "减掉补仓/出补仓" mean exit add-on tranche, not add more.
+            reduce_pct = _DEFAULT_REDUCE_PCT
+        if reduce_pct is None and _FULL_CLOSE_RE.search(text):
+            # Short directives like "市价止盈" / "全平" imply close all.
+            reduce_pct = 100.0
         if reduce_pct is not None:
             reduce_pct = max(0.0, min(100.0, reduce_pct))
-        add_match = _ADD_RE.search(text)
+        add_match = _ADD_RE.search(text) if not exit_addon else None
         add_pct: float | None = None
         if add_match:
             add_raw = add_match.group(1)
@@ -303,7 +352,7 @@ class PrivateChannelParser:
         if not has_action:
             return None
 
-        return ManageAction(
+        action = ManageAction(
             kind=ParsedKind.MANAGE_ACTION,
             raw_text=text,
             symbol=symbol,
@@ -317,6 +366,8 @@ class PrivateChannelParser:
             timestamp=timestamp,
             thread_id=thread_id,
         )
+        self._normalize_manage_defaults(action, text)
+        return action
 
     @staticmethod
     def _normalize(text: str) -> str:
@@ -376,6 +427,22 @@ class PrivateChannelParser:
         return _MARKET_RE.search(line.group(1) or "") is not None
 
     @staticmethod
+    def _extract_inline_market_anchor_and_side(text: str) -> tuple[float | None, Side | None]:
+        m = _INLINE_MARKET_ENTRY_RE.search(text)
+        if not m:
+            return None, None
+        price_raw = m.group(1)
+        side_raw = (m.group(2) or "").upper()
+        if not price_raw:
+            return None, None
+        side: Side | None = None
+        if side_raw in {"做多", "多", "LONG"}:
+            side = Side.LONG
+        elif side_raw in {"做空", "空", "SHORT"}:
+            side = Side.SHORT
+        return float(price_raw), side
+
+    @staticmethod
     def _has_field_evidence(field_evidence: dict[str, list[str]], field_path: str) -> bool:
         if field_path in field_evidence and field_evidence.get(field_path):
             return True
@@ -387,3 +454,31 @@ class PrivateChannelParser:
                     return True
             return False
         return False
+
+    @staticmethod
+    def _normalize_manage_defaults(action: ManageAction, text: str) -> None:
+        if _FULL_CLOSE_RE.search(text):
+            action.reduce_pct = 100.0
+            action.add_pct = None
+            return
+
+        exit_addon = _EXIT_ADDON_RE.search(text) is not None
+        reduce_match = _REDUCE_RE.search(text)
+        has_reduce_keyword = reduce_match is not None
+        explicit_reduce: float | None = None
+        if reduce_match:
+            raw_reduce = reduce_match.group(1)
+            if raw_reduce:
+                explicit_reduce = float(raw_reduce)
+
+        if explicit_reduce is not None:
+            action.reduce_pct = explicit_reduce
+        elif action.reduce_pct is None and (has_reduce_keyword or exit_addon):
+            action.reduce_pct = _DEFAULT_REDUCE_PCT
+
+        if action.reduce_pct is not None:
+            action.reduce_pct = max(0.0, min(100.0, float(action.reduce_pct)))
+
+        if exit_addon and action.reduce_pct is not None:
+            # "出补仓/减掉补仓" means reduce existing add-on, never add more.
+            action.add_pct = None

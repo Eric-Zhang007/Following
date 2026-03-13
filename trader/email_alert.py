@@ -48,6 +48,7 @@ _EVENT_LABELS = {
     "PRICE_FEED_ERROR_RECOVERED": "价格源异常恢复",
     "PRICE_FEED_WS_RECONNECT_RECOVERED": "行情连接恢复",
     "SL_AUTOFIX_FAILED_THEN_PANIC": "止损修复失败并触发紧急流程",
+    "NO_SL_DRAWDOWN_20": "无止损仓位亏损超阈值",
 }
 
 _PAYLOAD_LABELS = {
@@ -94,10 +95,16 @@ _PAYLOAD_LABELS = {
     "source": "来源",
     "mode": "模式",
     "elapsed_ms": "耗时(毫秒)",
+    "loss_pct": "亏损比例(%)",
+    "threshold_pct": "告警阈值(%)",
+    "cross_seq": "跨阈值序号",
 }
 
 
 class SMTPAlertSender:
+    _MAX_SEND_RETRIES = 2
+    _RETRY_BACKOFF_SECONDS = 1.0
+
     def __init__(self, config: EmailAlertConfig) -> None:
         self.config = config
         self._last_sent_at_by_key: dict[str, float] = {}
@@ -111,6 +118,8 @@ class SMTPAlertSender:
         level: str | None = None,
     ) -> bool:
         if not self.config.enabled:
+            return False
+        if self._is_cross_margin_event(event_type=event_type, payload=payload):
             return False
         allowed = {item.strip() for item in self.config.send_on if item.strip()}
         if not allowed:
@@ -162,16 +171,28 @@ class SMTPAlertSender:
         email_msg.set_content(self._render_email_text(event_type, level, msg, trace_id, payload))
 
         password = os.getenv(self.config.smtp_pass_env, "")
-        with smtplib.SMTP(self.config.smtp_host, self.config.smtp_port, timeout=10) as smtp:
-            smtp.ehlo()
+        last_error: Exception | None = None
+        for attempt in range(self._MAX_SEND_RETRIES + 1):
             try:
-                smtp.starttls()
-                smtp.ehlo()
-            except Exception:
-                pass
-            if self.config.smtp_user:
-                smtp.login(self.config.smtp_user, password)
-            smtp.send_message(email_msg)
+                with smtplib.SMTP(self.config.smtp_host, self.config.smtp_port, timeout=10) as smtp:
+                    smtp.ehlo()
+                    try:
+                        smtp.starttls()
+                        smtp.ehlo()
+                    except Exception:
+                        pass
+                    if self.config.smtp_user:
+                        smtp.login(self.config.smtp_user, password)
+                    smtp.send_message(email_msg)
+                last_error = None
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                if attempt >= self._MAX_SEND_RETRIES:
+                    raise
+                time.sleep(self._RETRY_BACKOFF_SECONDS * (2**attempt))
+        if last_error is not None:
+            raise last_error
         incident_action, incident_key = self._classify_incident(
             event_type=event_type,
             level=level,
@@ -184,6 +205,21 @@ class SMTPAlertSender:
         if incident_action == "none" and self.config.dedupe_seconds > 0:
             key = self._build_dedupe_key(event_type=event_type, payload=payload, msg=msg)
             self._last_sent_at_by_key[key] = time.time()
+
+    @staticmethod
+    def _is_cross_margin_event(*, event_type: str, payload: dict[str, Any] | None) -> bool:
+        if event_type == "CROSS_MARGIN":
+            return True
+        if not payload:
+            return False
+        for key in ("margin_mode", "mode"):
+            raw = payload.get(key)
+            if raw in (None, ""):
+                continue
+            normalized = str(raw).strip().lower()
+            if normalized in {"cross", "crossed", "全仓", "全倉"}:
+                return True
+        return False
 
     def _extract_leverage(self, payload: dict[str, Any] | None) -> float | None:
         if not payload:

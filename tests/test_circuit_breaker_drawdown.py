@@ -55,7 +55,7 @@ def _config() -> AppConfig:
     )
 
 
-def test_drawdown_breaker_enters_safe_mode_and_emits_event(tmp_path) -> None:
+def test_drawdown_breaker_emits_event_without_safe_mode_block(tmp_path) -> None:
     store = SQLiteStore(str(tmp_path / "dd.db"))
     alerts = AlertManager(Notifier(logging.getLogger("test")), store, logging.getLogger("test"))
     state = StateStore()
@@ -73,6 +73,6 @@ def test_drawdown_breaker_enters_safe_mode_and_emits_event(tmp_path) -> None:
 
     asyncio.run(daemon.tick_once())
 
-    assert state.safe_mode is True
+    assert state.safe_mode is False
     row = store.conn.execute("SELECT type FROM events WHERE type='DRAWDOWN_BREAKER' ORDER BY id DESC LIMIT 1").fetchone()
     assert row is not None

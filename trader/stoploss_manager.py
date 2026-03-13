@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from trader.alerts import AlertManager
 from trader.bitget_client import BitgetClient
 from trader.config import AppConfig
+from trader.side_mapper import close_side_for_hold, normalize_hold_side
 from trader.state import LocalGuardStop, OrderState, PositionState, StateStore, utc_now
 from trader.store import SQLiteStore
 
@@ -61,17 +62,9 @@ class StopLossManager:
                 elapsed_ms=self._elapsed_ms(started_at),
             )
 
-        trace = self.alerts.info(
-            "SL_AUTOFIX_ATTEMPT",
-            "attempting stop loss ensure",
-            {
-                "symbol": position_state.symbol,
-                "purpose": "sl",
-                "reason": source,
-                "desired_size": size,
-                "desired_sl_price": desired_sl_price,
-            },
-        )
+        # High-frequency SL checks can happen every poll tick; avoid emitting a
+        # verbose attempt event each time and keep only result events.
+        trace = uuid.uuid4().hex[:12]
 
         existing = self.state.get_stop_loss_order(position_state.symbol, position_state.side)
         if existing is not None:
@@ -150,7 +143,7 @@ class StopLossManager:
         )
 
     def validate_existing_sl(self, position_state: PositionState, sl_order_state: OrderState) -> tuple[bool, str]:
-        expected_close_side = "sell" if position_state.side.lower() == "long" else "buy"
+        expected_close_side = close_side_for_hold(position_state.side, self.config.bitget.position_mode)
         if sl_order_state.side.lower() != expected_close_side:
             return False, f"sl_side_mismatch: expected {expected_close_side}"
 
@@ -234,7 +227,6 @@ class StopLossManager:
                     trace_id=trace,
                 )
                 self.state.deactivate_local_guard_stop(guard.symbol, guard.side)
-                self.state.enable_safe_mode("local guard triggered")
             except Exception as exc:  # noqa: BLE001
                 self.state.register_api_error()
                 self.store.record_reconciler_action(
@@ -263,10 +255,10 @@ class StopLossManager:
         trace_id: str,
         started_at: float,
     ) -> StopLossResult:
-        close_side = "sell" if position_state.side.lower() == "long" else "buy"
+        hold_side = normalize_hold_side(position_state.side)
+        close_side = close_side_for_hold(hold_side, self.config.bitget.position_mode)
         reduce_only = self.config.bitget.position_mode == "one_way_mode"
         trade_side = "close" if self.config.bitget.position_mode == "hedge_mode" else None
-        hold_side = "long" if position_state.side.lower() == "long" else "short"
         client_oid = f"sl-{uuid.uuid4().hex[:16]}"
 
         if self.config.dry_run:
@@ -428,7 +420,7 @@ class StopLossManager:
         client_oid = f"local-guard-{uuid.uuid4().hex[:12]}"
         pseudo_order = OrderState(
             symbol=position_state.symbol,
-            side="sell" if position_state.side.lower() == "long" else "buy",
+            side=close_side_for_hold(position_state.side, self.config.bitget.position_mode),
             status="LOCAL_GUARD_ACTIVE",
             filled=0.0,
             quantity=size,
@@ -467,10 +459,9 @@ class StopLossManager:
         )
 
         if self.state.price_feed_mode == "rest" and self.config.monitor.price_feed.rest_fallback_action_when_local_guard == "safe_mode":
-            self.state.enable_safe_mode("local_guard with rest price feed")
             self.alerts.warn(
                 "LOCAL_GUARD_REST_DEGRADED",
-                "local guard armed while price feed in REST mode; safe_mode enabled",
+                "local guard armed while price feed in REST mode; safe_mode disabled so alert-only",
                 {"symbol": position_state.symbol, "purpose": "sl", "reason": source},
             )
 

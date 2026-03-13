@@ -72,11 +72,18 @@ class LLMParser:
             )
 
         sanitized = sanitize_text(text, self.config.llm.redact_patterns)
-        try:
-            payload = self._ensure_client().parse_signal(sanitized)
-            validated = LLMParsedOutput.model_validate(payload)
-        except Exception as exc:  # noqa: BLE001
-            raise LLMParseError(str(exc)) from exc
+        validated: LLMParsedOutput | None = None
+        last_exc: Exception | None = None
+        for _ in range(2):
+            try:
+                payload = self._ensure_client().parse_signal(sanitized)
+                validated = LLMParsedOutput.model_validate(payload)
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                continue
+        if validated is None:
+            raise LLMParseError(str(last_exc or "llm schema validation failed")) from last_exc
 
         payload_json = validated.model_dump(mode="json")
         self.store.save_llm_parse(
@@ -374,7 +381,12 @@ class HybridSignalParser:
             return bool(parsed.symbol and parsed.side and parsed.entry_low > 0 and parsed.entry_high > 0)
 
         if isinstance(parsed, ManageAction):
-            has_action = parsed.reduce_pct is not None or parsed.move_sl_to_be or parsed.tp_price is not None
+            has_action = (
+                parsed.reduce_pct is not None
+                or parsed.add_pct is not None
+                or parsed.move_sl_to_be
+                or parsed.tp_price is not None
+            )
             return parsed.symbol is not None and has_action
 
         return False

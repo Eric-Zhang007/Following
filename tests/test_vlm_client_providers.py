@@ -26,6 +26,19 @@ class _FakeSession:
         return _FakeHTTPResponse(self.payload)
 
 
+class _FakeSessionSequence:
+    def __init__(self, payloads: list[dict]) -> None:
+        self.payloads = payloads
+        self.headers: dict[str, str] = {}
+        self.calls: list[dict] = []
+
+    def post(self, url: str, data: str, timeout: int) -> _FakeHTTPResponse:
+        self.calls.append({"url": url, "data": data, "timeout": timeout})
+        idx = len(self.calls) - 1
+        payload = self.payloads[min(idx, len(self.payloads) - 1)]
+        return _FakeHTTPResponse(payload)
+
+
 def _valid_vlm_output() -> dict:
     return {
         "kind": "ENTRY_SIGNAL",
@@ -99,3 +112,25 @@ def test_vlm_extract_handles_fenced_json_response(monkeypatch) -> None:
 
     assert str(parsed.symbol) == "BTCUSDT"
     assert parsed.side.value == "LONG"
+
+
+def test_vlm_retries_once_when_schema_validation_fails(monkeypatch) -> None:
+    invalid = {"choices": [{"message": {"content": json.dumps({"symbol": "BTCUSDT"})}}]}
+    valid = {"choices": [{"message": {"content": json.dumps(_valid_vlm_output())}}]}
+    fake_session = _FakeSessionSequence([invalid, valid])
+    monkeypatch.setattr("trader.vlm_client.requests.Session", lambda: fake_session)
+    monkeypatch.setenv("TEST_VLM_KEY", "k-retry-vlm")
+
+    config = VLMConfig(
+        enabled=True,
+        provider="qwen",
+        model="qwen-vl-max-latest",
+        api_key_env="TEST_VLM_KEY",
+        base_url=None,
+        max_retries=0,
+    )
+    client = VLMClient(config)
+    parsed = client.extract(image_bytes=None, text_context="signal text")
+
+    assert len(fake_session.calls) == 2
+    assert str(parsed.symbol) == "BTCUSDT"

@@ -152,6 +152,7 @@ class TelegramEvent:
     is_edit: bool = False
     raw_text: str | None = None
     reply_to_msg_id: int | None = None
+    reply_to_chat_id: int | None = None
     media_type: str = "none"
     media_bytes: str | None = None
     media_path: str | None = None

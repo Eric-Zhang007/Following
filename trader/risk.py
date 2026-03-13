@@ -145,7 +145,12 @@ class RiskManager:
         if signal.entry_type == EntryType.MARKET:
             anchor = signal.entry_high if signal.entry_high > 0 else signal.entry_low
             if anchor > 0:
-                deviation = abs(current_price - anchor) / anchor
+                if signal.side.value == "LONG":
+                    # LONG market entries are allowed to fill below anchor; guard only upside chase.
+                    deviation = max(0.0, (current_price - anchor) / anchor)
+                else:
+                    # SHORT market entries are allowed to fill above anchor; guard only downside chase.
+                    deviation = max(0.0, (anchor - current_price) / anchor)
                 if deviation > max_slippage:
                     return RiskDecision.reject(
                         f"market anchor deviation {deviation:.4f} exceeds max_entry_slippage_pct {max_slippage:.4f}"
@@ -155,19 +160,34 @@ class RiskManager:
         if entry_price <= 0:
             return RiskDecision.reject("entry_price <= 0")
 
-        stop_loss_price, stop_distance = self._resolve_stop_loss(signal, entry_price)
-        if stop_loss_price is None or stop_distance <= 0:
-            return RiskDecision.reject("stop loss unavailable or invalid")
+        allow_missing_stop_loss = (
+            self.config.risk.allow_entry_without_stop_loss
+            and signal.stop_loss is None
+        )
+        if allow_missing_stop_loss:
+            stop_loss_price = None
+            stop_distance = 0.0
+            warnings.append("entry without explicit stop-loss accepted; waiting for thread follow-up update")
+        else:
+            stop_loss_price, stop_distance = self._resolve_stop_loss(signal, entry_price)
+            if stop_loss_price is None or stop_distance <= 0:
+                return RiskDecision.reject("stop loss unavailable or invalid")
 
-        if self.config.risk.hard_stop_loss_required and stop_loss_price is None:
+        if self.config.risk.hard_stop_loss_required and stop_loss_price is None and not allow_missing_stop_loss:
             return RiskDecision.reject("hard_stop_loss_required=true but stop loss is unavailable")
 
-        max_loss = account_equity * self.config.risk.account_risk_per_trade
-        quantity = max_loss / (stop_distance * entry_price)
-        if quantity <= 0:
-            return RiskDecision.reject("quantity <= 0")
+        if stop_distance > 0:
+            max_loss = account_equity * self.config.risk.account_risk_per_trade
+            quantity = max_loss / (stop_distance * entry_price)
+            if quantity <= 0:
+                return RiskDecision.reject("quantity <= 0")
+            notional = quantity * entry_price
+        else:
+            notional = float(max(account_equity, 0.0) * max(self.config.risk.account_risk_per_trade, 0.0) * max(leverage, 1))
+            quantity = (notional / entry_price) if entry_price > 0 else 0.0
+            if self.config.risk.hard_invariants.no_size_zero_orders and quantity <= 0:
+                return RiskDecision.reject("quantity <= 0")
 
-        notional = quantity * entry_price
         if notional > self.config.risk.max_notional_per_trade:
             notional = self.config.risk.max_notional_per_trade
             quantity = notional / entry_price
@@ -196,7 +216,13 @@ class RiskManager:
         if action.add_pct is not None and (action.add_pct <= 0 or action.add_pct > 200):
             return RiskDecision.reject(f"invalid add_pct: {action.add_pct}")
 
-        if action.reduce_pct is None and action.add_pct is None and not action.move_sl_to_be and action.tp_price is None:
+        if (
+            action.reduce_pct is None
+            and action.add_pct is None
+            and not action.move_sl_to_be
+            and action.tp_price is None
+            and action.stop_loss is None
+        ):
             return RiskDecision.reject("manage action has no executable fields")
 
         return RiskDecision(approved=True, symbol=action.symbol)

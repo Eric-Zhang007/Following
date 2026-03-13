@@ -2,10 +2,18 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
+import re
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from trader.models import EntrySignal, EntryType, ManageAction, NonSignal, ParsedKind, ParsedMessage, Side
+
+_FULL_CLOSE_HINT_RE = re.compile(
+    r"(?:市价止盈|市價止盈|市价止损|市價止損|全平|全部平仓|全部平倉|清仓|清倉|平仓出局|平倉出局|close\s*all)",
+    re.IGNORECASE,
+)
+_REDUCE_HINT_RE = re.compile(r"(?:减仓|減倉|平仓|平倉|减掉\s*补仓|減掉\s*補倉|出\s*补仓|出\s*補倉)", re.IGNORECASE)
+_DEFAULT_REDUCE_PCT = 35.0
 
 
 class LLMKind(str, Enum):
@@ -137,6 +145,10 @@ class LLMParsedOutput(BaseModel):
         add_pct = self.manage.add_pct
         move_sl_to_be = bool(self.manage.move_sl_to_be)
         tp_price = self.manage.tp[0] if self.manage.tp else None
+        if reduce_pct is None:
+            reduce_pct = _infer_reduce_default(raw_text)
+        if reduce_pct is not None and reduce_pct >= 100.0:
+            add_pct = None
 
         if reduce_pct is None and add_pct is None and not move_sl_to_be and tp_price is None:
             return NonSignal(
@@ -170,3 +182,13 @@ def get_response_format(name: str = "signal_parser") -> dict:
         "schema": get_llm_json_schema(),
         "strict": True,
     }
+
+
+def _infer_reduce_default(raw_text: str) -> float | None:
+    if not raw_text:
+        return None
+    if _FULL_CLOSE_HINT_RE.search(raw_text):
+        return 100.0
+    if _REDUCE_HINT_RE.search(raw_text):
+        return _DEFAULT_REDUCE_PCT
+    return None

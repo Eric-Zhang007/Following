@@ -117,3 +117,30 @@ def test_qwen_provider_parses_list_content(monkeypatch) -> None:
     assert parsed["provider"] == "qwen"
     assert parsed["model"] == "qwen3.5-plus"
     assert store["base_url"] == "https://dashscope-us.aliyuncs.com/compatible-mode/v1"
+
+
+def test_deepseek_backfills_market_anchor_from_text_when_entry_range_missing(monkeypatch) -> None:
+    store: dict = {}
+    _install_fake_openai(
+        monkeypatch,
+        store,
+        content=(
+            '{"kind":"ENTRY_SIGNAL","symbol":"PHAUSDT","side":"SHORT","leverage":null,'
+            '"entry":{"type":"MARKET","low":null,"high":null},'
+            '"manage":{"reduce_pct":null,"add_pct":null,"move_sl_to_be":null,"tp":[]},'
+            '"confidence":0.5,"notes":""}'
+        ),
+    )
+    monkeypatch.setenv("TEST_LLM_KEY", "k-deepseek")
+
+    config = LLMConfig(
+        provider="deepseek",
+        model="deepseek-chat",
+        api_key_env="TEST_LLM_KEY",
+        max_retries=0,
+    )
+    client = OpenAIResponsesClient(config)
+    parsed = client.parse_signal("#PHA 市價0.037附近空")
+
+    assert parsed["entry"]["low"] == 0.037
+    assert parsed["entry"]["high"] == 0.037

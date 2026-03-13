@@ -8,6 +8,7 @@ from dataclasses import asdict
 from trader.alerts import AlertManager
 from trader.bitget_client import BitgetClient
 from trader.config import AppConfig
+from trader.side_mapper import close_side_for_hold, normalize_hold_side
 from trader.state import OrderState, PositionState, StateStore, utc_now
 from trader.stoploss_manager import StopLossManager
 from trader.store import SQLiteStore
@@ -64,16 +65,8 @@ class OrderReconciler:
         self._process_be_reduce_local_guards()
 
     async def _reconcile_order(self, order: OrderState) -> None:
-        trace = self.alerts.info(
-            "RECONCILER_CHECK",
-            "checking pending order",
-            {
-                "symbol": order.symbol,
-                "purpose": order.purpose,
-                "client_order_id": order.client_order_id,
-                "order_id": order.order_id,
-            },
-        )
+        # Avoid high-frequency info events for every polling tick to keep DB/log volume bounded.
+        trace = f"reconcile-{int(time.time() * 1000)}"
 
         if self.config.dry_run:
             filled = order.quantity or order.filled
@@ -127,6 +120,7 @@ class OrderReconciler:
                 thread_id=order.thread_id,
                 purpose=order.purpose,
             )
+            self._track_filled_tp_progress(order=order, status=status, prev_status=prev_status, trace=trace)
 
             if order.purpose.lower() == "entry" and status in {"PARTIAL", "FILLED"} and filled > 0:
                 await self._ensure_entry_filled_has_sl(order=order, filled_qty=filled, avg_price=avg_price, trace=trace)
@@ -158,7 +152,16 @@ class OrderReconciler:
                 {"symbol": order.symbol, "retry": count, "error": str(exc), "purpose": order.purpose},
             )
             if count > self.config.execution.max_submit_retries:
-                self.state.enable_safe_mode("reconciler retries exceeded")
+                self.alerts.error(
+                    "RECONCILE_ORDER_ERROR_BURST",
+                    "reconcile retries exceeded configured threshold",
+                    {
+                        "symbol": order.symbol,
+                        "retry": count,
+                        "max_submit_retries": self.config.execution.max_submit_retries,
+                        "purpose": order.purpose,
+                    },
+                )
 
     def _fetch_order_state(self, order: OrderState) -> dict:
         try:
@@ -197,6 +200,24 @@ class OrderReconciler:
             raise
 
     async def _ensure_entry_filled_has_sl(self, order: OrderState, filled_qty: float, avg_price: float | None, trace: str) -> None:
+        desired_sl = self._thread_stop_loss(order.thread_id)
+        if desired_sl is None and (avg_price is None or avg_price <= 0):
+            # External/manual orders may not map to a tracked thread and can lack
+            # reliable average price from the exchange payload. Skip instead of
+            # raising repeated invalid_trigger_price failures every poll tick.
+            self.store.record_reconciler_action(
+                symbol=order.symbol,
+                order_id=order.order_id,
+                client_order_id=order.client_order_id,
+                action="PARTIAL_FILL_ENSURE_SL_SKIPPED",
+                reason="missing_thread_stoploss_and_avg_price",
+                payload={"qty": filled_qty, "purpose": "sl"},
+                trace_id=trace,
+                thread_id=order.thread_id,
+                purpose="sl",
+            )
+            return
+
         side = "long" if order.side.lower() == "buy" else "short"
         ps = PositionState(
             symbol=order.symbol,
@@ -213,7 +234,7 @@ class OrderReconciler:
         )
         result = self.stoploss_manager.ensure_stop_loss(
             position_state=ps,
-            desired_sl_price=self._thread_stop_loss(order.thread_id),
+            desired_sl_price=desired_sl,
             desired_size=filled_qty,
             source="reconciler_partial_fill",
             parent_client_order_id=order.client_order_id,
@@ -242,10 +263,10 @@ class OrderReconciler:
         thread = self.store.get_trade_thread(order.thread_id) if order.thread_id is not None else None
         if not thread:
             return
-        tp_points = [float(v) for v in thread.get("tp_points", []) if float(v) > 0]
+        tp_points = self._remaining_tp_points(order.thread_id)
         if not tp_points:
             return
-        if self._has_active_tp(order.symbol, order.thread_id):
+        if self._has_active_tp(order.symbol, order.thread_id, tp_points=tp_points):
             return
         self._place_tp_orders(
             symbol=order.symbol,
@@ -344,10 +365,10 @@ class OrderReconciler:
         if reduce_size <= 0:
             return
 
-        close_side = "sell" if side.upper() == "LONG" else "buy"
+        hold_side = normalize_hold_side(side)
+        close_side = close_side_for_hold(hold_side, self.config.bitget.position_mode)
         reduce_only = self.config.bitget.position_mode == "one_way_mode"
         trade_side = "close" if self.config.bitget.position_mode == "hedge_mode" else None
-        hold_side = "long" if close_side == "sell" else "short"
         trigger = avg_entry
         client_oid = f"be-{thread_id}-{int(utc_now().timestamp())}"
 
@@ -481,17 +502,107 @@ class OrderReconciler:
             return None
         return float(stop_loss)
 
-    def _has_active_tp(self, symbol: str, thread_id: int | None) -> bool:
+    def _track_filled_tp_progress(self, *, order: OrderState, status: str, prev_status: str, trace: str) -> None:
+        if order.purpose.lower() != "tp":
+            return
+        if status != "FILLED" or prev_status == "FILLED":
+            return
+        if order.thread_id is None or order.trigger_price is None:
+            return
+        remaining_tp_points = self.store.mark_tp_point_filled(thread_id=order.thread_id, tp_price=float(order.trigger_price))
+        self.store.record_reconciler_action(
+            symbol=order.symbol,
+            order_id=order.order_id,
+            client_order_id=order.client_order_id,
+            action="TP_PROGRESS_RECORDED",
+            reason="tp_filled",
+            payload={
+                "filled_tp_price": float(order.trigger_price),
+                "remaining_tp_points": remaining_tp_points,
+            },
+            trace_id=trace,
+            thread_id=order.thread_id,
+            purpose="tp",
+        )
+
+    def _remaining_tp_points(self, thread_id: int | None) -> list[float]:
+        if thread_id is None:
+            return []
+        for item in self.state.all_orders():
+            if item.thread_id != thread_id:
+                continue
+            if item.purpose.lower() != "tp":
+                continue
+            if item.status.upper() != "FILLED":
+                continue
+            if item.trigger_price is None:
+                continue
+            self.store.mark_tp_point_filled(thread_id=thread_id, tp_price=float(item.trigger_price))
+        return self.store.get_remaining_tp_points(thread_id)
+
+    def _has_active_tp(self, symbol: str, thread_id: int | None, *, tp_points: list[float] | None = None) -> bool:
+        thread = self.store.get_trade_thread(thread_id) if thread_id is not None else None
+        side_hint = str((thread or {}).get("side") or "").upper()
+        remaining_tp_points = (
+            [float(v) for v in tp_points]
+            if tp_points is not None
+            else self._remaining_tp_points(thread_id)
+        )
+        position = self.state.positions.get(symbol.upper())
+        entry_ref = float(position.entry_price) if position and position.entry_price not in {None, 0} else None
+        if entry_ref is None and remaining_tp_points:
+            # Infer side from relative TP location when position snapshot is absent.
+            min_tp = min(remaining_tp_points)
+            max_tp = max(remaining_tp_points)
+            if side_hint == "LONG":
+                entry_ref = min_tp
+            elif side_hint == "SHORT":
+                entry_ref = max_tp
+        expected_close_side = None
+        if side_hint == "LONG":
+            expected_close_side = close_side_for_hold("long", self.config.bitget.position_mode)
+        elif side_hint == "SHORT":
+            expected_close_side = close_side_for_hold("short", self.config.bitget.position_mode)
+
         for item in self.state.all_orders():
             if item.symbol.upper() != symbol.upper():
                 continue
             if item.thread_id != thread_id:
                 continue
-            if item.purpose.lower() != "tp":
+            if item.status.upper() in {"CANCELED", "FAILED", "REJECTED", "FILLED"}:
                 continue
-            if item.status.upper() in {"CANCELED", "FAILED", "REJECTED"}:
+            is_close_order = bool(item.reduce_only) or (item.trade_side or "").lower() == "close"
+            if not is_close_order:
                 continue
-            return True
+            if expected_close_side is not None and item.side.lower() != expected_close_side:
+                continue
+            purpose = item.purpose.lower()
+            if purpose == "tp":
+                if item.trigger_price is None:
+                    return True
+                trigger = float(item.trigger_price)
+                if not remaining_tp_points:
+                    continue
+                if any(abs(trigger - p) <= max(1e-9, abs(p) * 1e-6) for p in remaining_tp_points):
+                    return True
+                continue
+            if purpose in {"sl", "be_reduce", "be_reduce_local"}:
+                continue
+            if not item.is_plan_order:
+                continue
+            if item.trigger_price is None:
+                continue
+            trigger = float(item.trigger_price)
+            if remaining_tp_points and any(abs(trigger - p) <= max(1e-9, abs(p) * 1e-6) for p in remaining_tp_points):
+                return True
+            if remaining_tp_points:
+                continue
+            if entry_ref is None:
+                continue
+            if side_hint == "LONG" and trigger > entry_ref:
+                return True
+            if side_hint == "SHORT" and trigger < entry_ref:
+                return True
         return False
 
     def _place_tp_orders(
@@ -507,10 +618,10 @@ class OrderReconciler:
         started_at = time.perf_counter()
         if total_size <= 0 or not tp_points:
             return
-        side = "sell" if str(side_hint or "LONG").upper() == "LONG" else "buy"
+        hold_side = "long" if str(side_hint or "LONG").upper() == "LONG" else "short"
+        side = close_side_for_hold(hold_side, self.config.bitget.position_mode)
         trade_side = "close" if self.config.bitget.position_mode == "hedge_mode" else None
         reduce_only = self.config.bitget.position_mode == "one_way_mode"
-        hold_side = "long" if side == "sell" else "short"
 
         remaining_size = total_size
         placed = 0

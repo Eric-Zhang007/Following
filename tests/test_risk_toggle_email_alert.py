@@ -32,6 +32,37 @@ class _FakeSMTP:
         self.sent_messages.append(msg)
 
 
+class _FlakySMTP:
+    sent_messages = []
+    fail_before_success = 0
+    attempts = 0
+
+    def __init__(self, host: str, port: int, timeout: int = 10) -> None:  # noqa: ARG002
+        self.host = host
+        self.port = port
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):  # noqa: ANN001, ANN201
+        return False
+
+    def ehlo(self) -> None:
+        return None
+
+    def starttls(self) -> None:
+        return None
+
+    def login(self, user: str, pwd: str) -> None:  # noqa: ARG002
+        return None
+
+    def send_message(self, msg) -> None:  # noqa: ANN001
+        _FlakySMTP.attempts += 1
+        if _FlakySMTP.attempts <= _FlakySMTP.fail_before_success:
+            raise RuntimeError("Connection unexpectedly closed")
+        _FlakySMTP.sent_messages.append(msg)
+
+
 def _config() -> AppConfig:
     return AppConfig.model_validate(
         {
@@ -132,6 +163,22 @@ def test_high_leverage_email_sends_above_60x(monkeypatch, tmp_path) -> None:
     assert len(_FakeSMTP.sent_messages) == 1
 
 
+def test_cross_margin_email_is_suppressed(monkeypatch, tmp_path) -> None:
+    cfg = _config()
+    cfg.alerts.email.send_on = ["CROSS_MARGIN"]
+    store = SQLiteStore(str(tmp_path / "cross_margin_suppressed.db"))
+    notifier = Notifier(logging.getLogger("test"))
+    sender = SMTPAlertSender(cfg.alerts.email)
+    alerts = AlertManager(notifier=notifier, store=store, logger=logging.getLogger("test"), email_sender=sender)
+
+    _FakeSMTP.sent_messages.clear()
+    monkeypatch.setenv("SMTP_PASS", "dummy")
+    monkeypatch.setattr("smtplib.SMTP", _FakeSMTP)
+    alerts.warn("CROSS_MARGIN", "cross margin mode enabled for this thread", {"thread_id": 1, "margin_mode": "cross"})
+
+    assert len(_FakeSMTP.sent_messages) == 0
+
+
 def test_order_submitted_email_is_deduped(monkeypatch, tmp_path) -> None:
     cfg = _config()
     cfg.alerts.email.send_on = ["ORDER_SUBMITTED"]
@@ -222,3 +269,57 @@ def test_incident_email_sends_once_then_recovered_then_reopens(monkeypatch, tmp_
     )
 
     assert len(_FakeSMTP.sent_messages) == 3
+
+
+def test_email_send_retries_and_succeeds(monkeypatch) -> None:
+    cfg = _config()
+    cfg.alerts.email.send_on = ["ORDER_SUBMITTED"]
+    sender = SMTPAlertSender(cfg.alerts.email)
+
+    _FlakySMTP.sent_messages.clear()
+    _FlakySMTP.attempts = 0
+    _FlakySMTP.fail_before_success = 2
+    monkeypatch.setenv("SMTP_PASS", "dummy")
+    monkeypatch.setattr("smtplib.SMTP", _FlakySMTP)
+    monkeypatch.setattr("time.sleep", lambda _: None)
+
+    sender.send(
+        event_type="ORDER_SUBMITTED",
+        level="INFO",
+        msg="order submitted to exchange",
+        trace_id="t-retry-ok",
+        payload={"symbol": "ALICEUSDT", "purpose": "entry"},
+    )
+
+    assert _FlakySMTP.attempts == 3
+    assert len(_FlakySMTP.sent_messages) == 1
+
+
+def test_email_send_retries_exhausted(monkeypatch) -> None:
+    cfg = _config()
+    cfg.alerts.email.send_on = ["ORDER_SUBMITTED"]
+    sender = SMTPAlertSender(cfg.alerts.email)
+
+    _FlakySMTP.sent_messages.clear()
+    _FlakySMTP.attempts = 0
+    _FlakySMTP.fail_before_success = 10
+    monkeypatch.setenv("SMTP_PASS", "dummy")
+    monkeypatch.setattr("smtplib.SMTP", _FlakySMTP)
+    monkeypatch.setattr("time.sleep", lambda _: None)
+
+    try:
+        sender.send(
+            event_type="ORDER_SUBMITTED",
+            level="INFO",
+            msg="order submitted to exchange",
+            trace_id="t-retry-fail",
+            payload={"symbol": "ALICEUSDT", "purpose": "entry"},
+        )
+        raised = False
+    except RuntimeError as exc:
+        raised = True
+        assert "unexpectedly closed" in str(exc).lower()
+
+    assert raised is True
+    assert _FlakySMTP.attempts == 3
+    assert len(_FlakySMTP.sent_messages) == 0

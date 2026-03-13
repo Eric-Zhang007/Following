@@ -5,6 +5,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from trader.side_mapper import close_side_for_hold
+
 
 @dataclass
 class AccountState:
@@ -220,34 +222,68 @@ class StateStore:
                 self.orders_by_client_id[order.client_order_id] = order
 
     def has_valid_stop_loss(self, symbol: str, position_side: str) -> bool:
-        expected_close_side = "sell" if position_side.lower() == "long" else "buy"
         with self._lock:
+            position = self.positions.get(symbol.upper())
+            entry_price = None
+            if position is not None and position.side.lower() == position_side.lower():
+                entry_price = position.entry_price
             guard = self.local_guard_stops.get(_guard_key(symbol, position_side))
             if guard and guard.active:
                 return True
             for order in self._all_orders_locked():
                 if order.symbol.upper() != symbol.upper():
                     continue
-                if order.purpose.lower() != "sl":
+                purpose = order.purpose.lower()
+                if purpose != "sl":
+                    if purpose != "close":
+                        continue
+                    if order.trigger_price is None or entry_price is None:
+                        continue
+                    if position_side.lower() == "long" and float(order.trigger_price) > float(entry_price):
+                        continue
+                    if position_side.lower() == "short" and float(order.trigger_price) < float(entry_price):
+                        continue
+                if order.status.upper() in {"CANCELED", "FAILED", "REJECTED", "FILLED"}:
                     continue
-                if order.status.upper() in {"CANCELED", "FAILED", "REJECTED"}:
+                trade_side = (order.trade_side or "").lower()
+                if trade_side == "close":
+                    expected_close_side = close_side_for_hold(position_side, "hedge_mode")
+                elif order.reduce_only:
+                    expected_close_side = close_side_for_hold(position_side, "one_way_mode")
+                else:
                     continue
                 if order.side.lower() != expected_close_side:
-                    continue
-                if not order.reduce_only and (order.trade_side or "").lower() != "close":
                     continue
                 return True
         return False
 
     def get_stop_loss_order(self, symbol: str, position_side: str) -> OrderState | None:
-        expected_close_side = "sell" if position_side.lower() == "long" else "buy"
         with self._lock:
+            position = self.positions.get(symbol.upper())
+            entry_price = None
+            if position is not None and position.side.lower() == position_side.lower():
+                entry_price = position.entry_price
             for order in self._all_orders_locked():
                 if order.symbol.upper() != symbol.upper():
                     continue
-                if order.purpose.lower() != "sl":
+                purpose = order.purpose.lower()
+                if purpose != "sl":
+                    if purpose != "close":
+                        continue
+                    if order.trigger_price is None or entry_price is None:
+                        continue
+                    if position_side.lower() == "long" and float(order.trigger_price) > float(entry_price):
+                        continue
+                    if position_side.lower() == "short" and float(order.trigger_price) < float(entry_price):
+                        continue
+                if order.status.upper() in {"CANCELED", "FAILED", "REJECTED", "FILLED"}:
                     continue
-                if order.status.upper() in {"CANCELED", "FAILED", "REJECTED"}:
+                trade_side = (order.trade_side or "").lower()
+                if trade_side == "close":
+                    expected_close_side = close_side_for_hold(position_side, "hedge_mode")
+                elif order.reduce_only:
+                    expected_close_side = close_side_for_hold(position_side, "one_way_mode")
+                else:
                     continue
                 if order.side.lower() != expected_close_side:
                     continue

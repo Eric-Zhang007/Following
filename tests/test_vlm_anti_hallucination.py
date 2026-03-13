@@ -1,6 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
+from trader.models import ManageAction
 from trader.vlm_schema import VLMParsedSignal
 
 
@@ -90,3 +91,28 @@ def test_non_null_field_without_evidence_is_rejected() -> None:
     }
     with pytest.raises(ValidationError):
         VLMParsedSignal.model_validate(payload)
+
+
+def test_vlm_manage_reduce_without_pct_defaults_to_35() -> None:
+    payload = {
+        "kind": "MANAGE_ACTION",
+        "symbol": "BTCUSDT",
+        "side": None,
+        "leverage": None,
+        "entry": {"type": None, "low": None, "high": None, "stop_loss": None, "tp": []},
+        "manage": {"reduce_pct": None, "move_sl_to_be": False, "tp": []},
+        "evidence": {
+            "field_evidence": {"symbol": ["BTCUSDT"]},
+            "source": {"symbol": "text"},
+        },
+        "uncertain_fields": ["manage.reduce_pct"],
+        "extraction_warnings": [],
+        "safety": {"should_trade": "NO_DECISION"},
+        "confidence": 0.5,
+        "notes": "",
+    }
+    parsed = VLMParsedSignal.model_validate(payload)
+    msg = parsed.to_parsed_message("#BTC 减仓", timestamp=None)
+
+    assert isinstance(msg, ManageAction)
+    assert msg.reduce_pct == 35

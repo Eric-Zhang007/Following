@@ -1,4 +1,4 @@
-dry_run: true
+dry_run: false
 
 listener:
   mode: "telegram_private"      # telegram_private / telegram / web_preview
@@ -16,12 +16,18 @@ telegram:
   session_name: "ivan_listener"
   channel_id: -1000000000000     # 私有频道必须填写 -100xxxxxxxxxx
   channel_ids: []                # 可选：多频道并行监听，填写多个 -100xxxxxxxxxx
+  channel_usernames: ["@IvanCryptotalk"]  # 可选：多频道并行监听，填写 @channelusername
+  discussion_chat_ids: []        # 可选：讨论群ID；非 reply 且无交易关键词的消息将直接忽略（省LLM）
   channel_title_hint: null
   accept_only_after_startup: true
   startup_replay_days: 0          # >0 时启动后回补最近 N 天消息（仍会做风控）
   enable_edited_events: true
   channel: "@IvanCryptotalk"
   notify_chat_id: null
+  mirror_forward_source_ids: []   # 可选：将指定来源 chat_id 的消息实时转发到验证账号（这些来源默认不参与交易解析）
+  mirror_forward_targets: []      # 可选：转发目标，如 ["@aa3845226"]
+  mirror_forward_include_edits: false
+  mirror_forward_skip_prestartup: true
 
 bitget:
   base_url: "https://api.bitget.com"
@@ -35,7 +41,7 @@ bitget:
   plan_orders_probe_on_startup: true
   plan_orders_capability_ttl_seconds: 300
   plan_orders_probe_timeout_seconds: 6
-  plan_orders_probe_safe_mode_on_failure: true
+  plan_orders_probe_safe_mode_on_failure: false  # deprecated: safe_mode no longer blocks entries
 
 filters:
   symbol_policy: "ALLOWLIST"
@@ -56,16 +62,17 @@ risk:
   leverage_policy: "CAP"
   default_stop_loss_pct: 0.006
   hard_stop_loss_required: true
+  allow_entry_without_stop_loss: false
+  no_stop_loss_loss_alert_pct: 0.2
   max_entry_slippage_pct: 0.003
   max_notional_per_trade: 200
-  max_open_positions: 3
+  max_open_positions: 50
   cooldown_seconds: 300
   min_signal_quality: 0.8
   allow_symbols_policy: "ALLOWLIST"
   symbol_allowlist: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "CYBERUSDT", "KITEUSDT"]
   symbol_blacklist: []
   min_24h_usdt_volume: null
-  max_total_margin_used_pct: 0.35
   max_liquidation_distance_pct: 0.01
   stoploss:
     must_exist: true
@@ -104,7 +111,7 @@ monitor:
     max_ws_parse_error_ratio: 0.2
     ws_required_for_local_guard: true
     required_symbols: []
-    rest_fallback_action_when_local_guard: "safe_mode"  # notify_only / safe_mode
+    rest_fallback_action_when_local_guard: "notify_only"  # safe_mode deprecated
   health:
     host: "127.0.0.1"
     port: 8080
@@ -124,11 +131,19 @@ storage:
   media_dir: "media"
 
 execution:
+  margin_sizing_mode: "risk_cap"   # risk_cap / adaptive_leverage
   margin_mode: "cross"
   per_trade_margin_usdt: 25
+  adaptive_margin_wallet_balance_source: "available"  # available / equity
+  adaptive_margin_base_ratio: 0.04
+  adaptive_margin_min_ratio: 0.01
+  adaptive_margin_max_ratio: 0.12
+  adaptive_margin_base_leverage: 50
+  adaptive_margin_min_usdt: 5
+  adaptive_margin_max_usdt: 60
   entry_split_ratio: [1, 2]
   order_type: "limit_only"
-  max_concurrent_trades: 3
+  max_concurrent_trades: 50
   place_tp_on_fill: true
   be_reduce_on_two_entries: true
   be_reduce_pct: 50

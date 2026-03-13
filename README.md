@@ -3,7 +3,7 @@
 本项目实现：
 `监听` -> `解析（规则 + VLM）` -> `结构化校验` -> `风控` -> `Bitget 执行`。
 
-默认安全策略：`dry_run: true`。
+默认策略：`dry_run: false`。
 
 ## 本次补丁重点
 - 新增 `web_preview` 监听模式：轮询 `https://t.me/s/IvanCryptotalk`，无需 Telegram `api_id/api_hash`
@@ -123,13 +123,13 @@ bitget:
   plan_orders_probe_on_startup: true
   plan_orders_capability_ttl_seconds: 300
   plan_orders_probe_timeout_seconds: 6
-  plan_orders_probe_safe_mode_on_failure: true
+  plan_orders_probe_safe_mode_on_failure: false  # deprecated（safe_mode 不再拦截开仓）
 ```
 
 监控启动后，即使没有新信号也会持续运行：
 - 主动刷新权益、保证金、持仓、挂单
 - 检查不变量（仓位必须有保护、重复开仓防护、异常持仓告警）
-- 风险触发时自动进入 `safe_mode`（禁止新开仓）
+- 风险触发时发出告警/邮件，不自动阻断新开仓
 
 ## 执行层止损说明（生产）
 `ENTRY_SIGNAL` 会生成成套订单意图（Entry + Stop-loss + 可选 TP）。
@@ -148,7 +148,7 @@ Plan/Trigger 能力探测（生产建议开启）：
 
 关键语义：
 - ENTRY 成交后立刻补挂 SL；部分成交按已成交数量挂对应 SL。
-- 风控守护发现缺 SL 时先补挂，超时失败才触发保护性平仓 + 熔断。
+- 风控守护发现缺 SL 时先补挂，超时失败才触发保护性平仓 + 告警。
 - `move_sl_to_be` 会撤旧 SL 并重挂到保本位（含 `break_even_buffer_pct` 缓冲）。
 - 支持分批 TP（reduce-only / tradeSide=close）并纳入对账。
 
@@ -158,17 +158,15 @@ one-way / hedge 差异：
 
 ## 生产运行建议
 1. 推荐 `isolated` + `risk.max_leverage` 硬上限，避免高杠杆信号直接照抄执行。
-2. 上线顺序：`dry_run=true` 观察 -> 小额实盘 -> 再逐步扩大规模。
+2. 上线顺序：先小额实盘验证，再逐步扩大规模。
 3. 配置 kill switch：
-   - 文件触发：创建 `./KILL_SWITCH`（内容为空或 `safe` 进入 `SAFE_MODE`，`panic` 进入 `PANIC_CLOSE`）
-   - 环境变量：`TRADER_KILL_SWITCH=1`（SAFE_MODE）或 `TRADER_KILL_SWITCH=panic`（PANIC_CLOSE）
-4. 明确安全模式语义：
-   - `safe_mode`：禁止新开仓，只允许风控修复、止损、减仓和平仓。
-   - `panic_close`：一次性触发保护性平仓流程，并保持禁止开仓。
-5. `ws` 行情建议保持开启；若降级到 `rest` 且使用 `local_guard`，系统会执行额外安全降级动作（可配置）。
+   - 文件触发：创建 `./KILL_SWITCH`（内容为空或 `safe` 仅告警，`panic` 进入 `PANIC_CLOSE`）
+   - 环境变量：`TRADER_KILL_SWITCH=1`（SAFE 仅告警）或 `TRADER_KILL_SWITCH=panic`（PANIC_CLOSE）
+4. `panic_close`：一次性触发保护性平仓流程，并保持禁止开仓。
+5. `ws` 行情建议保持开启；若降级到 `rest` 且使用 `local_guard`，系统会执行额外降级告警动作（可配置）。
 6. 若启用 `monitor.price_feed.ws_required_for_local_guard=true`：
    - `local_guard` + `rest` 降级会导致 `readyz` 不通过；
-   - 建议配合 `safe_mode` 自动启用，防止在低质量行情源下继续开仓。
+   - 建议通过邮件/值班告警处理，不再自动拦截开仓。
 
 ## 测试
 ```bash

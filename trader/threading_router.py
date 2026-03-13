@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -24,14 +25,34 @@ class TradeThreadRouter:
     def __init__(self, store: SQLiteStore) -> None:
         self.store = store
 
-    def resolve(self, *, message_id: int, text: str, reply_to_msg_id: int | None) -> ThreadResolveResult:
+    def resolve(
+        self,
+        *,
+        chat_id: int = 0,
+        message_id: int,
+        text: str,
+        reply_to_msg_id: int | None,
+        reply_to_chat_id: int | None = None,
+    ) -> ThreadResolveResult:
         normalized = self._normalize(text)
         if TRADE_SIGNAL_KEYWORD_RE.search(normalized):
-            return ThreadResolveResult(thread_id=message_id, is_root=True, reason="root_keyword_detected")
+            return ThreadResolveResult(
+                thread_id=self.compose_thread_id(chat_id=chat_id, message_id=message_id),
+                is_root=True,
+                reason="root_keyword_detected",
+            )
         if self._looks_like_standalone_entry_signal(normalized):
-            return ThreadResolveResult(thread_id=message_id, is_root=True, reason="root_structure_detected")
+            return ThreadResolveResult(
+                thread_id=self.compose_thread_id(chat_id=chat_id, message_id=message_id),
+                is_root=True,
+                reason="root_structure_detected",
+            )
 
-        thread_id = self.store.resolve_thread_root_by_reply(reply_to_msg_id)
+        thread_id = self.store.resolve_thread_root_by_reply(
+            chat_id=chat_id,
+            reply_to_msg_id=reply_to_msg_id,
+            reply_to_chat_id=reply_to_chat_id,
+        )
         if thread_id is not None:
             return ThreadResolveResult(thread_id=thread_id, is_root=False, reason="reply_thread_resolved")
 
@@ -50,3 +71,10 @@ class TradeThreadRouter:
         has_tp = TP_HINT_RE.search(text) is not None
         has_sl = SL_HINT_RE.search(text) is not None
         return has_entry and (has_tp or has_sl)
+
+    @staticmethod
+    def compose_thread_id(*, chat_id: int, message_id: int) -> int:
+        if chat_id == 0:
+            return int(message_id)
+        digest = hashlib.blake2b(f"{int(chat_id)}:{int(message_id)}".encode("utf-8"), digest_size=8).digest()
+        return int.from_bytes(digest, "big") & ((1 << 63) - 1)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 import uuid
 from decimal import Decimal, ROUND_DOWN
@@ -10,6 +11,7 @@ from trader.bitget_client import BitgetClient
 from trader.config import AppConfig
 from trader.models import EntrySignal, EntryType, ManageAction, OrderIntent, RiskDecision
 from trader.notifier import Notifier
+from trader.side_mapper import close_side_for_hold
 from trader.state import OrderState, PositionState, StateStore, utc_now
 from trader.stoploss_manager import StopLossManager
 from trader.store import SQLiteStore
@@ -263,7 +265,10 @@ class TradeExecutor:
     ) -> dict[str, int]:
         side = "buy" if signal.side.value == "LONG" else "sell"
         trade_side = "open" if self.config.bitget.position_mode == "hedge_mode" else None
-        leverage = int(signal.leverage or 1)
+        signal_leverage = int(signal.leverage or 1)
+        leverage = signal_leverage
+        if risk_decision is not None and risk_decision.leverage is not None and risk_decision.leverage > 0:
+            leverage = int(risk_decision.leverage)
         is_market = signal.entry_type == EntryType.MARKET
         entry_points = [float(p) for p in (signal.entry_points or []) if float(p) > 0]
         if is_market:
@@ -297,18 +302,17 @@ class TradeExecutor:
         if len(entry_points) > 2:
             entry_points = entry_points[:2]
 
-        notional = float(self.config.execution.per_trade_margin_usdt) * float(leverage)
-        if risk_decision is not None and risk_decision.notional is not None and risk_decision.notional > 0:
-            notional = min(notional, float(risk_decision.notional))
-        qty_total_raw = notional / float(entry_points[0])
-        qty_parts = self._split_entry_quantities(
-            qty_total_raw,
-            len(entry_points),
-            symbol=signal.symbol,
-            leverage=leverage,
-        )
+        adaptive_margin_ctx: dict[str, float | str] | None = None
+        if self.config.execution.margin_sizing_mode == "adaptive_leverage":
+            margin_usdt_per_entry, adaptive_margin_ctx = self._adaptive_margin_usdt(leverage)
+        else:
+            margin_usdt_per_entry = float(self.config.execution.per_trade_margin_usdt)
 
-        if self.config.risk.hard_invariants.no_size_zero_orders and qty_total_raw <= 0:
+        notional_per_entry = float(margin_usdt_per_entry) * float(leverage)
+        qty_parts = [notional_per_entry / float(price) for price in entry_points]
+        qty_total_raw = sum(qty_parts)
+
+        if self.config.risk.hard_invariants.no_size_zero_orders and any(q <= 0 for q in qty_parts):
             self.store.record_execution(
                 chat_id=chat_id,
                 message_id=message_id,
@@ -318,7 +322,12 @@ class TradeExecutor:
                 side=signal.side.value,
                 status="REJECTED",
                 reason="qty_total<=0",
-                intent={"thread_id": thread_id, "entry_points": entry_points, "qty_total_raw": qty_total_raw},
+                intent={
+                    "thread_id": thread_id,
+                    "entry_points": entry_points,
+                    "qty_total_raw": qty_total_raw,
+                    "notional_per_entry": notional_per_entry,
+                },
                 thread_id=thread_id,
                 purpose="entry",
             )
@@ -327,6 +336,14 @@ class TradeExecutor:
         if not self.config.dry_run:
             hold_side = "long" if signal.side.value == "LONG" else "short"
             self.bitget.set_leverage(signal.symbol, leverage, hold_side=hold_side)
+
+        existing_entry_prices: set[float] = set()
+        if not is_market and not self.config.dry_run:
+            existing_entry_prices = self._collect_existing_entry_prices(
+                symbol=signal.symbol,
+                side=side,
+                trade_side=trade_side,
+            )
 
         placed = 0
         failed = 0
@@ -341,6 +358,10 @@ class TradeExecutor:
                 "side": side,
                 "trade_side": trade_side,
                 "order_type": order_type,
+                "signal_leverage": signal_leverage,
+                "effective_leverage": leverage,
+                "margin_sizing_mode": self.config.execution.margin_sizing_mode,
+                "margin_usdt_per_entry": margin_usdt_per_entry,
                 "quantity": qty,
                 "price": normalized_price,
                 "entry_index": idx,
@@ -348,8 +369,11 @@ class TradeExecutor:
                 "tp_points": signal.tp_points or signal.take_profit,
                 "stop_loss": signal.stop_loss,
                 "thread_id": thread_id,
-                "notional": notional,
+                "notional_per_entry": notional_per_entry,
+                "total_entry_notional": notional_per_entry * len(entry_points),
             }
+            if adaptive_margin_ctx is not None:
+                intent["adaptive_margin"] = adaptive_margin_ctx
             client_order_id = f"entry-{thread_id}-{idx}-{uuid.uuid4().hex[:8]}"
             self._register_runtime_order(
                 symbol=signal.symbol,
@@ -373,6 +397,28 @@ class TradeExecutor:
                     side=signal.side.value,
                     status="REJECTED",
                     reason=reject_reason,
+                    intent=intent,
+                    thread_id=thread_id,
+                    purpose="entry",
+                )
+                continue
+
+            if (
+                not is_market
+                and not self.config.dry_run
+                and normalized_price is not None
+                and float(normalized_price) in existing_entry_prices
+            ):
+                failed += 1
+                self.store.record_execution(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    version=version,
+                    action_type="ENTRY",
+                    symbol=signal.symbol,
+                    side=signal.side.value,
+                    status="SKIPPED",
+                    reason="duplicate_open_entry_order_at_price",
                     intent=intent,
                     thread_id=thread_id,
                     purpose="entry",
@@ -441,6 +487,8 @@ class TradeExecutor:
                     order_id=str(order_id) if order_id else None,
                     client_order_id=client_order_id,
                 )
+                if not is_market and normalized_price is not None:
+                    existing_entry_prices.add(float(normalized_price))
                 placed += 1
             except Exception as exc:  # noqa: BLE001
                 failed += 1
@@ -459,6 +507,44 @@ class TradeExecutor:
                 )
 
         return {"placed": placed, "failed": failed}
+
+    def _collect_existing_entry_prices(self, *, symbol: str, side: str, trade_side: str | None) -> set[float]:
+        out: set[float] = set()
+        try:
+            open_orders = self.bitget.get_open_orders(symbol)
+        except Exception:  # noqa: BLE001
+            return out
+
+        want_side = side.lower()
+        want_trade_side = (trade_side or "").lower()
+        for order in open_orders:
+            order_side = str(order.get("side") or "").lower()
+            if order_side != want_side:
+                continue
+
+            order_trade_side = str(order.get("tradeSide") or order.get("trade_side") or "").lower()
+            if want_trade_side and order_trade_side and order_trade_side != want_trade_side:
+                continue
+
+            reduce_only = str(order.get("reduceOnly") or order.get("reduce_only") or "").strip().lower()
+            if reduce_only in {"yes", "true", "1"}:
+                continue
+
+            price_raw = order.get("price")
+            if price_raw in {None, ""}:
+                continue
+            try:
+                price = float(price_raw)
+            except Exception:  # noqa: BLE001
+                continue
+            if price <= 0:
+                continue
+
+            _, normalized_price, _ = self._normalize_order_params(symbol, 1.0, price)
+            if normalized_price is None or normalized_price <= 0:
+                continue
+            out.add(float(normalized_price))
+        return out
 
     def execute_manage(
         self,
@@ -487,6 +573,16 @@ class TradeExecutor:
             )
             self.notifier.warning("MANAGE rejected: symbol unresolved")
             return
+
+        tp_points = list(action.tp_points) if action.tp_points else ([float(action.tp_price)] if action.tp_price is not None else [])
+        if thread_id is None:
+            thread_id = self.store.find_latest_thread_id_by_symbol(symbol)
+        self._sync_thread_targets(
+            thread_id=thread_id,
+            symbol=symbol,
+            stop_loss=(float(action.stop_loss) if action.stop_loss is not None else None),
+            tp_points=[float(v) for v in tp_points] if tp_points else None,
+        )
 
         if self.config.dry_run:
             intent = OrderIntent(
@@ -700,7 +796,7 @@ class TradeExecutor:
                     return
 
                 close_qty_raw = position_size * (action.reduce_pct / 100.0)
-                side = "sell" if hold_side == "long" else "buy"
+                side = close_side_for_hold(hold_side, self.config.bitget.position_mode)
                 trade_side = "close" if self.config.bitget.position_mode == "hedge_mode" else None
                 reduce_only = self.config.bitget.position_mode == "one_way_mode"
 
@@ -886,7 +982,6 @@ class TradeExecutor:
                 )
                 self.notifier.error(f"MANAGE move_sl_to_be failed {symbol}: {exc}")
 
-        tp_points = list(action.tp_points) if action.tp_points else ([float(action.tp_price)] if action.tp_price is not None else [])
         if tp_points:
             self._cancel_existing_tp_orders(symbol)
             tp_result = self._place_take_profit_orders(
@@ -970,6 +1065,29 @@ class TradeExecutor:
                     purpose="manage_sl",
                 )
 
+    def _sync_thread_targets(
+        self,
+        *,
+        thread_id: int | None,
+        symbol: str,
+        stop_loss: float | None,
+        tp_points: list[float] | None,
+    ) -> None:
+        if thread_id is None:
+            return
+        existing = self.store.get_trade_thread(thread_id)
+        status = str((existing or {}).get("status") or "ACTIVE")
+        self.store.upsert_trade_thread(
+            thread_id=thread_id,
+            symbol=symbol,
+            side=None,
+            leverage=None,
+            stop_loss=stop_loss,
+            tp_points=tp_points,
+            status=status,
+            target_version=int((existing or {}).get("target_version") or 1),
+        )
+
     def place_break_even_reduce(
         self,
         *,
@@ -985,12 +1103,11 @@ class TradeExecutor:
         trigger_price = avg_entry
         if side.upper() == "LONG":
             trigger_price = avg_entry * (1 + float(self.config.execution.be_reduce_buffer_pct))
-            close_side = "sell"
             hold_side = "long"
         else:
             trigger_price = avg_entry * (1 - float(self.config.execution.be_reduce_buffer_pct))
-            close_side = "buy"
             hold_side = "short"
+        close_side = close_side_for_hold(hold_side, self.config.bitget.position_mode)
 
         raw_size = total_size * (float(self.config.execution.be_reduce_pct) / 100.0)
         normalized_size, _, reject_reason = self._normalize_order_params(symbol, raw_size, None)
@@ -1368,6 +1485,43 @@ class TradeExecutor:
             },
         )
 
+    def _adaptive_margin_usdt(self, leverage: int) -> tuple[float, dict[str, float | str]]:
+        cfg = self.config.execution
+        eff_lev = max(float(leverage), 1.0)
+        ratio_ref_lev = max(float(cfg.adaptive_margin_base_leverage), 1.0)
+        ratio_min = float(cfg.adaptive_margin_min_ratio)
+        ratio_max = float(cfg.adaptive_margin_max_ratio)
+        ratio_base = float(cfg.adaptive_margin_base_ratio)
+        scaled_ratio = ratio_base * math.sqrt(ratio_ref_lev / eff_lev)
+        adaptive_ratio = max(ratio_min, min(ratio_max, scaled_ratio))
+
+        source = cfg.adaptive_margin_wallet_balance_source
+        source_used = source
+        wallet_balance = 0.0
+        if self.runtime_state is not None and self.runtime_state.account is not None:
+            account = self.runtime_state.account
+            wallet_balance = float(account.available if source == "available" else account.equity)
+        if wallet_balance <= 0:
+            wallet_balance = float(self.config.risk.assumed_equity_usdt)
+            source_used = "assumed_equity"
+
+        min_margin = float(cfg.adaptive_margin_min_usdt)
+        ratio_margin = wallet_balance * adaptive_ratio
+        # Max margin cap is intentionally disabled; margin follows wallet * ratio
+        # with only a lower bound to avoid dust-size orders.
+        margin_usdt = max(min_margin, ratio_margin)
+        return margin_usdt, {
+            "wallet_balance_source": source_used,
+            "wallet_balance": wallet_balance,
+            "base_ratio": ratio_base,
+            "adaptive_ratio": adaptive_ratio,
+            "ratio_ref_leverage": ratio_ref_lev,
+            "effective_leverage": eff_lev,
+            "ratio_margin_usdt": ratio_margin,
+            "clamped_margin_usdt": margin_usdt,
+            "max_margin_usdt_config": float(cfg.adaptive_margin_max_usdt),
+        }
+
     @staticmethod
     def _round_down(value: float, decimals: int) -> float:
         q = Decimal(1).scaleb(-max(decimals, 0))
@@ -1525,10 +1679,10 @@ class TradeExecutor:
             return {"placed": 0, "skipped": len(tp_list), "last_reason": "size_unknown"}
 
         resolved_side = side_hint or self._resolve_position_side_hint(symbol) or "LONG"
-        side = "sell" if resolved_side.upper() == "LONG" else "buy"
+        hold_side = "long" if resolved_side.upper() == "LONG" else "short"
+        side = close_side_for_hold(hold_side, self.config.bitget.position_mode)
         trade_side = "close" if self.config.bitget.position_mode == "hedge_mode" else None
         reduce_only = self.config.bitget.position_mode == "one_way_mode"
-        hold_side = "long" if side == "sell" else "short"
 
         placed = 0
         skipped = 0

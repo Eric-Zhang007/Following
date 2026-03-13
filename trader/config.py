@@ -13,13 +13,20 @@ class TelegramConfig(BaseModel):
     session_name: str = "ivan_listener"
     channel_id: int | None = None
     channel_ids: list[int] = Field(default_factory=list)
+    channel_usernames: list[str] = Field(default_factory=list)
     channel_title_hint: str | None = None
+    discussion_chat_ids: list[int] = Field(default_factory=list)
     accept_only_after_startup: bool = True
     startup_replay_days: int = Field(default=0, ge=0, le=7)
     enable_edited_events: bool = True
     # Legacy field kept for compatibility with old telegram mode.
     channel: str = "@IvanCryptotalk"
     notify_chat_id: int | None = None
+    # Optional validation-forwarding: mirror selected source chats to target users/chats.
+    mirror_forward_source_ids: list[int] = Field(default_factory=list)
+    mirror_forward_targets: list[str] = Field(default_factory=list)
+    mirror_forward_include_edits: bool = False
+    mirror_forward_skip_prestartup: bool = True
 
     @field_validator("channel_ids")
     @classmethod
@@ -35,6 +42,74 @@ class TelegramConfig(BaseModel):
                 continue
             seen.add(cid)
             out.append(cid)
+        return out
+
+    @field_validator("discussion_chat_ids")
+    @classmethod
+    def normalize_discussion_chat_ids(cls, value: list[int]) -> list[int]:
+        out: list[int] = []
+        seen: set[int] = set()
+        for raw in value:
+            try:
+                cid = int(raw)
+            except Exception:  # noqa: BLE001
+                continue
+            if cid in seen:
+                continue
+            seen.add(cid)
+            out.append(cid)
+        return out
+
+    @field_validator("mirror_forward_source_ids")
+    @classmethod
+    def normalize_mirror_forward_source_ids(cls, value: list[int]) -> list[int]:
+        out: list[int] = []
+        seen: set[int] = set()
+        for raw in value:
+            try:
+                cid = int(raw)
+            except Exception:  # noqa: BLE001
+                continue
+            if cid in seen:
+                continue
+            seen.add(cid)
+            out.append(cid)
+        return out
+
+    @field_validator("channel_usernames")
+    @classmethod
+    def normalize_channel_usernames(cls, value: list[str]) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        for raw in value:
+            name = str(raw or "").strip()
+            if not name:
+                continue
+            if not name.startswith("@"):
+                name = f"@{name}"
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(name)
+        return out
+
+    @field_validator("mirror_forward_targets")
+    @classmethod
+    def normalize_mirror_forward_targets(cls, value: list[str]) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        for raw in value:
+            name = str(raw or "").strip()
+            if not name:
+                continue
+            if not name.startswith("@"):
+                name = f"@{name}"
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(name)
         return out
 
 
@@ -65,7 +140,7 @@ class BitgetConfig(BaseModel):
     plan_orders_probe_on_startup: bool = True
     plan_orders_capability_ttl_seconds: int = Field(default=300, ge=10, le=86400)
     plan_orders_probe_timeout_seconds: int = Field(default=6, ge=1, le=30)
-    plan_orders_probe_safe_mode_on_failure: bool = True
+    plan_orders_probe_safe_mode_on_failure: bool = False
 
 
 class FiltersConfig(BaseModel):
@@ -104,10 +179,12 @@ class RiskConfig(BaseModel):
     leverage_policy: Literal["CAP", "REJECT"] = "CAP"
     default_stop_loss_pct: float = Field(default=0.006, gt=0)
     hard_stop_loss_required: bool = True
+    allow_entry_without_stop_loss: bool = False
+    no_stop_loss_loss_alert_pct: float = Field(default=0.2, gt=0, lt=1)
     max_entry_slippage_pct: float = Field(default=0.003, ge=0)
     max_notional_per_trade: float = 200.0
     entry_slippage_pct: float | None = None
-    max_open_positions: int = Field(default=3, ge=1, le=100)
+    max_open_positions: int = Field(default=50, ge=1, le=100)
     cooldown_seconds: int = 300
     min_signal_quality: float = Field(default=0.8, ge=0, le=1)
     allow_symbols_policy: Literal["ALLOWLIST", "ALLOW_ALL"] = "ALLOWLIST"
@@ -177,11 +254,19 @@ class StorageConfig(BaseModel):
 
 
 class ExecutionConfig(BaseModel):
+    margin_sizing_mode: Literal["risk_cap", "adaptive_leverage"] = "risk_cap"
     margin_mode: Literal["cross", "isolated"] = "cross"
     per_trade_margin_usdt: float = Field(default=25, gt=0)
+    adaptive_margin_wallet_balance_source: Literal["available", "equity"] = "available"
+    adaptive_margin_base_ratio: float = Field(default=0.04, gt=0, le=1)
+    adaptive_margin_min_ratio: float = Field(default=0.01, gt=0, le=1)
+    adaptive_margin_max_ratio: float = Field(default=0.12, gt=0, le=1)
+    adaptive_margin_base_leverage: float = Field(default=50.0, gt=0)
+    adaptive_margin_min_usdt: float = Field(default=5.0, gt=0)
+    adaptive_margin_max_usdt: float = Field(default=60.0, gt=0)
     entry_split_ratio: list[int] = Field(default_factory=lambda: [1, 2])
     order_type: Literal["limit_only"] = "limit_only"
-    max_concurrent_trades: int = Field(default=3, ge=1, le=100)
+    max_concurrent_trades: int = Field(default=50, ge=1, le=100)
     place_tp_on_fill: bool = True
     be_reduce_on_two_entries: bool = True
     be_reduce_pct: float = Field(default=50.0, gt=0, le=100)
@@ -204,6 +289,14 @@ class ExecutionConfig(BaseModel):
         if any(v <= 0 for v in value):
             raise ValueError("entry_split_ratio values must be > 0")
         return value
+
+    @model_validator(mode="after")
+    def validate_adaptive_margin(self) -> "ExecutionConfig":
+        if self.adaptive_margin_max_ratio < self.adaptive_margin_min_ratio:
+            raise ValueError("adaptive_margin_max_ratio must be >= adaptive_margin_min_ratio")
+        if self.adaptive_margin_max_usdt < self.adaptive_margin_min_usdt:
+            raise ValueError("adaptive_margin_max_usdt must be >= adaptive_margin_min_usdt")
+        return self
 
 
 class LLMConfig(BaseModel):
@@ -255,7 +348,7 @@ class MonitorPriceFeedConfig(BaseModel):
     max_ws_parse_error_ratio: float = Field(default=0.2, ge=0.0, le=1.0)
     ws_required_for_local_guard: bool = True
     required_symbols: list[str] = Field(default_factory=list)
-    rest_fallback_action_when_local_guard: Literal["notify_only", "safe_mode"] = "safe_mode"
+    rest_fallback_action_when_local_guard: Literal["notify_only", "safe_mode"] = "notify_only"
 
     @field_validator("required_symbols")
     @classmethod
@@ -323,6 +416,7 @@ class EmailAlertConfig(BaseModel):
             "PRESTARTUP_STOPLOSS_GUARD_REJECTED",
             "POSITION_CLOSED_PNL_FETCH_FAIL",
             "POSITION_CLOSED_SUMMARY",
+            "NO_SL_DRAWDOWN_20",
             "LOCAL_GUARD_TRIGGERED",
             "LOCAL_GUARD_TRIGGER_FAILED",
         ]
@@ -336,7 +430,7 @@ class AlertsConfig(BaseModel):
 class AppConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    dry_run: bool = True
+    dry_run: bool = False
     listener: ListenerConfig = Field(default_factory=ListenerConfig)
     telegram: TelegramConfig
     bitget: BitgetConfig
@@ -358,8 +452,17 @@ class AppConfig(BaseModel):
                     "telegram.api_id and telegram.api_hash are required when listener.mode in {telegram, telegram_private}"
                 )
         if self.listener.mode == "telegram_private":
-            if self.telegram.channel_id is None and not self.telegram.channel_ids:
-                raise ValueError("telegram.channel_id or telegram.channel_ids is required when listener.mode=telegram_private")
+            has_target = (
+                self.telegram.channel_id is not None
+                or bool(self.telegram.channel_ids)
+                or bool(self.telegram.channel_usernames)
+                or bool((self.telegram.channel or "").strip())
+            )
+            if not has_target:
+                raise ValueError(
+                    "telegram.channel_id / telegram.channel_ids / telegram.channel_usernames / telegram.channel "
+                    "is required when listener.mode=telegram_private"
+                )
         return self
 
 

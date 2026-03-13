@@ -15,6 +15,12 @@ from trader.account_poller import AccountPoller
 from trader.alerts import AlertManager
 from trader.bitget_client import BitgetClient
 from trader.config import AppConfig, load_config
+from trader.discussion_filter import (
+    chat_id_variants as _chat_id_variants_impl,
+    is_channel_chat as _is_channel_chat_impl,
+    is_discussion_chat as _is_discussion_chat_impl,
+    should_skip_discussion_noise as _should_skip_discussion_noise_impl,
+)
 from trader.email_alert import SMTPAlertSender
 from trader.entry_fallback import convert_market_to_limit_signal, is_market_slippage_reject
 from trader.executor import TradeExecutor
@@ -22,7 +28,7 @@ from trader.health_server import HealthServer
 from trader.kill_switch import KillSwitch
 from trader.llm_parser import HybridSignalParser, ParseOutcome
 from trader.media import MediaManager
-from trader.models import EntrySignal, ManageAction, NeedsManual, NonSignal, ParsedKind, ParsedMessage, TelegramEvent, utc_now
+from trader.models import EntrySignal, EntryType, ManageAction, NeedsManual, NonSignal, ParsedKind, ParsedMessage, TelegramEvent, utc_now
 from trader.notifier import Notifier
 from trader.order_reconciler import OrderReconciler
 from trader.private_channel_parser import PrivateChannelParser
@@ -37,11 +43,10 @@ from trader.store import SQLiteStore
 from trader.symbol_registry import SymbolRegistry
 from trader.telegram_listener import TelegramListener
 from trader.telegram_private_listener import TelegramPrivateListener
-from trader.threading_router import TradeThreadRouter
+from trader.threading_router import ThreadResolveResult, TradeThreadRouter
 from trader.web_preview_listener import WebPreviewListener
 
 app = typer.Typer(add_completion=False, help="Telegram/WebPreview signal -> Bitget executor")
-
 
 def _setup_logging(config: AppConfig) -> logging.Logger:
     level = getattr(logging, config.logging.level.upper(), logging.INFO)
@@ -218,8 +223,19 @@ async def _run_async(config_path: Path) -> None:
             )
 
             if message_state.duplicate and not event.is_edit:
-                logger.info("Duplicate message ignored: chat=%s message=%s", event.chat_id, event.message_id)
-                return
+                if store.has_message_processing_records(
+                    chat_id=event.chat_id,
+                    message_id=event.message_id,
+                    version=message_state.version,
+                ):
+                    logger.info("Duplicate message ignored: chat=%s message=%s", event.chat_id, event.message_id)
+                    return
+                logger.warning(
+                    "Duplicate message without processing records; reprocessing. chat=%s message=%s version=%s",
+                    event.chat_id,
+                    event.message_id,
+                    message_state.version,
+                )
 
             image_bytes: bytes | None = None
             if event.image_url:
@@ -370,8 +386,8 @@ async def _run_async(config_path: Path) -> None:
                 return
 
             if isinstance(parsed, EntrySignal):
-                if runtime_state.safe_mode:
-                    reason = f"safe_mode active: {runtime_state.block_new_entries_reason or 'risk daemon'}"
+                if runtime_state.panic_mode:
+                    reason = f"panic_mode active: {runtime_state.block_new_entries_reason or 'risk daemon'}"
                     store.record_execution(
                         chat_id=event.chat_id,
                         message_id=event.message_id,
@@ -646,6 +662,17 @@ async def _handle_private_event(
     runtime_state: StateStore,
 ) -> None:
     text = (event.raw_text or event.text or "").strip()
+    if _should_skip_discussion_noise(config=config, event=event, text=text):
+        store.record_event(
+            event_type="DISCUSSION_NON_REPLY_IGNORED",
+            level="INFO",
+            msg="discussion message ignored because it is non-reply and has no trade hints",
+            payload={"chat_id": event.chat_id, "message_id": event.message_id},
+            reason="discussion_non_reply_no_trade_hint",
+            thread_id=event.thread_id,
+        )
+        return
+
     message_state = store.record_message(
         chat_id=event.chat_id,
         message_id=event.message_id,
@@ -663,12 +690,28 @@ async def _handle_private_event(
                 reason="duplicate_edit",
                 thread_id=event.thread_id,
             )
-        return
+            return
+        if store.has_message_processing_records(
+            chat_id=event.chat_id,
+            message_id=event.message_id,
+            version=message_state.version,
+        ):
+            return
+        store.record_event(
+            event_type="THREAD_DUPLICATE_RECOVERY",
+            level="WARN",
+            msg="duplicate message has no processing records; forcing reprocess",
+            payload={"message_id": event.message_id, "version": message_state.version},
+            reason="duplicate_without_processing",
+            thread_id=event.thread_id,
+        )
 
     thread_result = thread_router.resolve(
+        chat_id=event.chat_id,
         message_id=event.message_id,
         text=text,
         reply_to_msg_id=event.reply_to_msg_id,
+        reply_to_chat_id=event.reply_to_chat_id,
     )
     if thread_result.thread_id is None:
         # Fallback parse for non-thread messages to reduce missed root signals.
@@ -681,7 +724,30 @@ async def _handle_private_event(
             is_root=True,
             prefer_llm_fallback=True,
         )
-        if isinstance(fallback_outcome.parsed, (EntrySignal, ManageAction)):
+        fallback_parsed = fallback_outcome.parsed
+        if isinstance(fallback_parsed, NonSignal):
+            recovered = parser.recover_from_non_signal(
+                text=text,
+                timestamp=event.date,
+                image_path=event.media_path,
+                fallback_symbol=store.get_last_entry_symbol(event.chat_id),
+                thread_id=event.message_id,
+            )
+            if recovered is not None and isinstance(recovered.parsed, (EntrySignal, ManageAction)):
+                fallback_outcome = recovered
+                fallback_parsed = recovered.parsed
+                store.record_event(
+                    event_type="NON_SIGNAL_AI_RECOVERED",
+                    level="INFO",
+                    msg="non-thread message recovered by AI reparse",
+                    payload={
+                        "message_id": event.message_id,
+                        "parse_source": recovered.parse_source,
+                        "confidence": recovered.confidence,
+                    },
+                    reason="non_thread_non_signal_reparse",
+                )
+        if isinstance(fallback_parsed, (EntrySignal, ManageAction)):
             store.record_event(
                 event_type="THREAD_MESSAGE_FALLBACK_PARSED",
                 level="INFO",
@@ -693,8 +759,37 @@ async def _handle_private_event(
                 },
                 reason=thread_result.reason,
             )
-            thread_id = event.message_id
-            thread_result = type(thread_result)(thread_id=thread_id, is_root=True, reason="fallback_root_parsed")
+            if isinstance(fallback_parsed, ManageAction):
+                symbol = str(fallback_parsed.symbol or "").upper()
+                if symbol:
+                    existing_for_symbol = store.get_latest_trade_thread_by_symbol(symbol, active_only=True)
+                    if existing_for_symbol is not None:
+                        thread_result = ThreadResolveResult(
+                            thread_id=int(existing_for_symbol["thread_id"]),
+                            is_root=False,
+                            reason="fallback_manage_bound_by_symbol",
+                        )
+                    else:
+                        thread_id = thread_router.compose_thread_id(chat_id=event.chat_id, message_id=event.message_id)
+                        thread_result = ThreadResolveResult(
+                            thread_id=thread_id,
+                            is_root=True,
+                            reason="fallback_manage_new_root",
+                        )
+                else:
+                    thread_id = thread_router.compose_thread_id(chat_id=event.chat_id, message_id=event.message_id)
+                    thread_result = ThreadResolveResult(
+                        thread_id=thread_id,
+                        is_root=True,
+                        reason="fallback_manage_new_root",
+                    )
+            else:
+                thread_id = thread_router.compose_thread_id(chat_id=event.chat_id, message_id=event.message_id)
+                thread_result = ThreadResolveResult(
+                    thread_id=thread_id,
+                    is_root=True,
+                    reason="fallback_root_parsed",
+                )
         else:
             store.record_event(
                 event_type="THREAD_MESSAGE_IGNORED",
@@ -752,6 +847,7 @@ async def _handle_private_event(
         )
     store.record_thread_message(
         thread_id=thread_id,
+        chat_id=event.chat_id,
         message_id=event.message_id,
         is_root=thread_result.is_root,
         kind="ROOT" if thread_result.is_root else "REPLY",
@@ -768,6 +864,71 @@ async def _handle_private_event(
         is_root=thread_result.is_root,
     )
     parsed = parse_outcome.parsed
+    if isinstance(parsed, NonSignal):
+        recovered = parser.recover_from_non_signal(
+            text=text,
+            timestamp=event.date,
+            image_path=event.media_path,
+            fallback_symbol=fallback_symbol,
+            thread_id=thread_id,
+        )
+        if recovered is not None and isinstance(recovered.parsed, (EntrySignal, ManageAction)):
+            parse_outcome = recovered
+            parsed = recovered.parsed
+            store.record_event(
+                event_type="NON_SIGNAL_AI_RECOVERED",
+                level="INFO",
+                msg="non-signal recovered by AI reparse",
+                payload={
+                    "thread_id": thread_id,
+                    "message_id": event.message_id,
+                    "parse_source": recovered.parse_source,
+                    "confidence": recovered.confidence,
+                },
+                reason="non_signal_reparse",
+                thread_id=thread_id,
+            )
+
+    if isinstance(parsed, EntrySignal) and parsed.entry_type == EntryType.MARKET and not _entry_has_anchor(parsed):
+        ai_anchor = parser.recover_from_non_signal(
+            text=text,
+            timestamp=event.date,
+            image_path=event.media_path,
+            fallback_symbol=fallback_symbol,
+            thread_id=thread_id,
+        )
+        if ai_anchor is not None and isinstance(ai_anchor.parsed, EntrySignal) and _entry_has_anchor(ai_anchor.parsed):
+            parsed.entry_low = ai_anchor.parsed.entry_low
+            parsed.entry_high = ai_anchor.parsed.entry_high
+            parsed.entry_points = [float(p) for p in ai_anchor.parsed.entry_points if float(p) > 0]
+            if parsed.stop_loss is None and ai_anchor.parsed.stop_loss is not None:
+                parsed.stop_loss = float(ai_anchor.parsed.stop_loss)
+            if not parsed.tp_points and ai_anchor.parsed.tp_points:
+                parsed.tp_points = [float(p) for p in ai_anchor.parsed.tp_points]
+                parsed.take_profit = [float(p) for p in ai_anchor.parsed.take_profit or ai_anchor.parsed.tp_points]
+            store.record_event(
+                event_type="MARKET_ANCHOR_FROM_AI",
+                level="INFO",
+                msg="market signal anchor hydrated from AI parse",
+                payload={
+                    "thread_id": thread_id,
+                    "symbol": parsed.symbol,
+                    "parse_source": ai_anchor.parse_source,
+                    "entry_points": parsed.entry_points,
+                },
+                reason="market_anchor_ai",
+                thread_id=thread_id,
+            )
+
+    if isinstance(parsed, EntrySignal):
+        _hydrate_market_anchor_from_history(
+            signal=parsed,
+            event_time=event.date,
+            bitget=bitget,
+            store=store,
+            thread_id=thread_id,
+        )
+
     store.record_parsed_signal(
         event.chat_id,
         event.message_id,
@@ -827,6 +988,31 @@ async def _handle_private_event(
         return
 
     if isinstance(parsed, EntrySignal):
+        existing_status = str((existing_thread or {}).get("status") or "").upper()
+        if event.pre_startup and thread_result.is_root and existing_status == "CLOSED":
+            store.record_execution(
+                chat_id=event.chat_id,
+                message_id=event.message_id,
+                version=message_state.version,
+                action_type="ENTRY",
+                symbol=parsed.symbol,
+                side=parsed.side.value,
+                status="RECORDED",
+                reason="prestartup_closed_thread_replay_ignored",
+                intent=_to_dict(parsed),
+                thread_id=thread_id,
+                purpose="entry",
+            )
+            store.record_event(
+                event_type="PRESTARTUP_CLOSED_THREAD_REPLAY_IGNORED",
+                level="INFO",
+                msg="prestartup root entry replay ignored because thread already closed",
+                payload={"thread_id": thread_id, "symbol": parsed.symbol, "message_id": event.message_id},
+                reason="closed_thread_replay_ignored",
+                thread_id=thread_id,
+            )
+            return
+
         parsed.thread_id = thread_id
         store.upsert_trade_thread(
             thread_id=thread_id,
@@ -861,7 +1047,7 @@ async def _handle_private_event(
             should_emit=(parsed.leverage or 0) >= 20,
         )
 
-        if runtime_state.safe_mode and config.risk.hard_invariants.kill_switch_enforced:
+        if runtime_state.panic_mode:
             store.record_execution(
                 chat_id=event.chat_id,
                 message_id=event.message_id,
@@ -870,7 +1056,7 @@ async def _handle_private_event(
                 symbol=parsed.symbol,
                 side=parsed.side.value,
                 status="REJECTED",
-                reason=f"safe_mode active: {runtime_state.block_new_entries_reason or 'risk daemon'}",
+                reason=f"panic_mode active: {runtime_state.block_new_entries_reason or 'risk daemon'}",
                 intent=_to_dict(parsed),
                 thread_id=thread_id,
                 purpose="entry",
@@ -1136,6 +1322,10 @@ def _prestartup_stoploss_guard_reason(
     if signal_time >= startup_at:
         return None
 
+    if config.risk.allow_entry_without_stop_loss and signal.stop_loss is None:
+        # Strategy can intentionally open first and wait for thread follow-up SL/TP updates.
+        return None
+
     stop_loss_price = _resolve_entry_stop_loss_price(signal, config)
     if stop_loss_price is None or stop_loss_price <= 0:
         return "prestartup_guard_stop_loss_unavailable"
@@ -1157,9 +1347,57 @@ def _prestartup_stoploss_guard_reason(
     return None
 
 
+def _entry_has_anchor(signal: EntrySignal) -> bool:
+    if any(float(p) > 0 for p in (signal.entry_points or [])):
+        return True
+    return float(signal.entry_low or 0.0) > 0 or float(signal.entry_high or 0.0) > 0
+
+
+def _hydrate_market_anchor_from_history(
+    *,
+    signal: EntrySignal,
+    event_time: datetime | None,
+    bitget: BitgetClient,
+    store: SQLiteStore,
+    thread_id: int | None,
+) -> None:
+    if signal.entry_type != EntryType.MARKET or _entry_has_anchor(signal):
+        return
+    if event_time is None:
+        return
+    try:
+        ref_price = bitget.get_reference_price_at(symbol=signal.symbol, at_time=event_time)
+    except Exception as exc:  # noqa: BLE001
+        store.record_event(
+            event_type="MARKET_ANCHOR_HISTORY_FAILED",
+            level="WARN",
+            msg="failed to resolve market anchor from historical candles",
+            payload={"symbol": signal.symbol, "reason": str(exc)},
+            reason="market_anchor_history_failed",
+            thread_id=thread_id,
+        )
+        return
+    if ref_price is None or ref_price <= 0:
+        return
+
+    signal.entry_low = float(ref_price)
+    signal.entry_high = float(ref_price)
+    signal.entry_points = [float(ref_price)]
+    store.record_event(
+        event_type="MARKET_ANCHOR_FROM_HISTORY",
+        level="INFO",
+        msg="market signal anchor hydrated from historical candle close",
+        payload={"symbol": signal.symbol, "anchor_price": float(ref_price), "event_time": event_time.isoformat()},
+        reason="market_anchor_history",
+        thread_id=thread_id,
+    )
+
+
 def _resolve_entry_stop_loss_price(signal: EntrySignal, config: AppConfig) -> float | None:
     if signal.stop_loss is not None:
         return float(signal.stop_loss)
+    if config.risk.allow_entry_without_stop_loss:
+        return None
     entry_price = _pick_entry_price_for_guard(signal, config)
     if entry_price <= 0:
         return None
@@ -1190,6 +1428,34 @@ def _ratio_from_percent_or_ratio(value: float) -> float:
     if value > 0.05:
         return value / 100.0
     return value
+
+
+def _chat_id_variants(chat_id: int) -> set[int]:
+    return _chat_id_variants_impl(chat_id)
+
+
+def _is_discussion_chat(config: AppConfig, chat_id: int) -> bool:
+    return _is_discussion_chat_impl(
+        discussion_chat_ids=config.telegram.discussion_chat_ids,
+        chat_id=chat_id,
+    )
+
+
+def _is_channel_chat(config: AppConfig, chat_id: int) -> bool:
+    return _is_channel_chat_impl(
+        channel_id=config.telegram.channel_id,
+        channel_ids=config.telegram.channel_ids,
+        chat_id=chat_id,
+    )
+
+
+def _should_skip_discussion_noise(*, config: AppConfig, event: TelegramEvent, text: str) -> bool:
+    return _should_skip_discussion_noise_impl(
+        discussion_chat_ids=config.telegram.discussion_chat_ids,
+        channel_id=config.telegram.channel_id,
+        channel_ids=config.telegram.channel_ids,
+        event=event,
+    )
 
 
 def _emit_once_per_thread_alert(

@@ -186,6 +186,7 @@ class SQLiteStore:
                 stop_loss REAL,
                 entry_points_json TEXT,
                 tp_points_json TEXT,
+                filled_tp_points_json TEXT,
                 target_version INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -195,7 +196,8 @@ class SQLiteStore:
             CREATE TABLE IF NOT EXISTS thread_messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 thread_id INTEGER NOT NULL,
-                message_id INTEGER NOT NULL UNIQUE,
+                chat_id INTEGER NOT NULL DEFAULT 0,
+                message_id INTEGER NOT NULL,
                 is_root INTEGER NOT NULL,
                 kind TEXT,
                 created_at TEXT NOT NULL,
@@ -229,6 +231,8 @@ class SQLiteStore:
         self._ensure_column("trade_threads", "stop_loss", "REAL")
         self._ensure_column("trade_threads", "entry_points_json", "TEXT")
         self._ensure_column("trade_threads", "tp_points_json", "TEXT")
+        self._ensure_column("trade_threads", "filled_tp_points_json", "TEXT")
+        self._ensure_thread_messages_chat_scope()
 
         self.conn.commit()
 
@@ -238,6 +242,72 @@ class SQLiteStore:
         existing = {str(row[1]) for row in cur.fetchall()}
         if column not in existing:
             cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+
+    def _ensure_thread_messages_chat_scope(self) -> None:
+        cur = self.conn.cursor()
+        cur.execute("PRAGMA table_info(thread_messages)")
+        cols = [str(row[1]) for row in cur.fetchall()]
+        has_chat_id = "chat_id" in cols
+
+        has_composite_unique = False
+        has_legacy_message_unique = False
+        cur.execute("PRAGMA index_list(thread_messages)")
+        indexes = cur.fetchall()
+        for idx in indexes:
+            # index_list columns: seq, name, unique, origin, partial
+            idx_name = str(idx[1])
+            is_unique = int(idx[2]) == 1
+            if not is_unique:
+                continue
+            cur.execute(f"PRAGMA index_info('{idx_name}')")
+            idx_cols = [str(r[2]) for r in cur.fetchall()]
+            if idx_cols == ["message_id"]:
+                has_legacy_message_unique = True
+            if idx_cols == ["chat_id", "message_id"]:
+                has_composite_unique = True
+
+        needs_rebuild = (not has_chat_id) or has_legacy_message_unique or (not has_composite_unique)
+        if not needs_rebuild:
+            return
+
+        old_has_chat_id = has_chat_id
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS thread_messages_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                thread_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL DEFAULT 0,
+                message_id INTEGER NOT NULL,
+                is_root INTEGER NOT NULL,
+                kind TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(thread_id) REFERENCES trade_threads(thread_id)
+            )
+            """
+        )
+        if old_has_chat_id:
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO thread_messages_new(id, thread_id, chat_id, message_id, is_root, kind, created_at)
+                SELECT id, thread_id, COALESCE(chat_id, 0), message_id, is_root, kind, created_at
+                FROM thread_messages
+                """
+            )
+        else:
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO thread_messages_new(id, thread_id, chat_id, message_id, is_root, kind, created_at)
+                SELECT id, thread_id, 0, message_id, is_root, kind, created_at
+                FROM thread_messages
+                """
+            )
+
+        cur.execute("DROP TABLE thread_messages")
+        cur.execute("ALTER TABLE thread_messages_new RENAME TO thread_messages")
+        cur.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_thread_messages_chat_msg ON thread_messages(chat_id, message_id)"
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_thread_messages_thread_id ON thread_messages(thread_id)")
 
     def record_message(
         self,
@@ -466,6 +536,30 @@ class SQLiteStore:
         )
         self.conn.commit()
         return int(cur.lastrowid)
+
+    def has_message_processing_records(self, chat_id: int, message_id: int, version: int) -> bool:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT 1
+            FROM parsed_signals
+            WHERE chat_id=? AND message_id=? AND version=?
+            LIMIT 1
+            """,
+            (chat_id, message_id, version),
+        )
+        if cur.fetchone() is not None:
+            return True
+        cur.execute(
+            """
+            SELECT 1
+            FROM executions
+            WHERE chat_id=? AND message_id=? AND version=?
+            LIMIT 1
+            """,
+            (chat_id, message_id, version),
+        )
+        return cur.fetchone() is not None
 
     def record_order_receipt(self, execution_id: int, exchange_order_id: str | None, payload: Any) -> None:
         self.conn.execute(
@@ -718,6 +812,7 @@ class SQLiteStore:
         stop_loss: float | None = None,
         entry_points: list[float] | None = None,
         tp_points: list[float] | None = None,
+        filled_tp_points: list[float] | None = None,
         status: str = "ACTIVE",
         target_version: int = 1,
     ) -> None:
@@ -725,10 +820,10 @@ class SQLiteStore:
         self.conn.execute(
             """
             INSERT INTO trade_threads(
-                thread_id, symbol, side, leverage, stop_loss, entry_points_json, tp_points_json,
+                thread_id, symbol, side, leverage, stop_loss, entry_points_json, tp_points_json, filled_tp_points_json,
                 target_version, created_at, updated_at, status
             )
-            VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(thread_id) DO UPDATE SET
                 symbol=COALESCE(excluded.symbol, trade_threads.symbol),
                 side=COALESCE(excluded.side, trade_threads.side),
@@ -736,6 +831,7 @@ class SQLiteStore:
                 stop_loss=COALESCE(excluded.stop_loss, trade_threads.stop_loss),
                 entry_points_json=COALESCE(excluded.entry_points_json, trade_threads.entry_points_json),
                 tp_points_json=COALESCE(excluded.tp_points_json, trade_threads.tp_points_json),
+                filled_tp_points_json=COALESCE(excluded.filled_tp_points_json, trade_threads.filled_tp_points_json),
                 target_version=MAX(excluded.target_version, trade_threads.target_version),
                 updated_at=excluded.updated_at,
                 status=excluded.status
@@ -748,6 +844,7 @@ class SQLiteStore:
                 stop_loss,
                 json.dumps(entry_points, ensure_ascii=False, default=str) if entry_points is not None else None,
                 json.dumps(tp_points, ensure_ascii=False, default=str) if tp_points is not None else None,
+                json.dumps(filled_tp_points, ensure_ascii=False, default=str) if filled_tp_points is not None else None,
                 int(target_version),
                 now,
                 now,
@@ -761,7 +858,7 @@ class SQLiteStore:
         cur.execute(
             """
             SELECT
-                thread_id, symbol, side, leverage, stop_loss, entry_points_json, tp_points_json,
+                thread_id, symbol, side, leverage, stop_loss, entry_points_json, tp_points_json, filled_tp_points_json,
                 target_version, created_at, updated_at, status
             FROM trade_threads
             WHERE thread_id=?
@@ -780,11 +877,50 @@ class SQLiteStore:
             "stop_loss": row["stop_loss"],
             "entry_points": json.loads(row["entry_points_json"]) if row["entry_points_json"] else [],
             "tp_points": json.loads(row["tp_points_json"]) if row["tp_points_json"] else [],
+            "filled_tp_points": json.loads(row["filled_tp_points_json"]) if row["filled_tp_points_json"] else [],
             "target_version": int(row["target_version"]),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
             "status": row["status"],
         }
+
+    def get_remaining_tp_points(self, thread_id: int) -> list[float]:
+        thread = self.get_trade_thread(thread_id)
+        if thread is None:
+            return []
+        tp_points = [float(v) for v in thread.get("tp_points", []) if float(v) > 0]
+        filled_tp_points = [float(v) for v in thread.get("filled_tp_points", []) if float(v) > 0]
+        return [tp for tp in tp_points if not any(self._tp_matches(tp, filled) for filled in filled_tp_points)]
+
+    def mark_tp_point_filled(self, *, thread_id: int, tp_price: float | None) -> list[float]:
+        if tp_price in {None, ""}:
+            return self.get_remaining_tp_points(thread_id)
+        thread = self.get_trade_thread(thread_id)
+        if thread is None:
+            return []
+
+        filled_tp_points = [float(v) for v in thread.get("filled_tp_points", []) if float(v) > 0]
+        target_price = float(tp_price)
+        canonical_price = target_price
+        for candidate in thread.get("tp_points", []):
+            candidate_price = float(candidate)
+            if self._tp_matches(candidate_price, target_price):
+                canonical_price = candidate_price
+                break
+        if any(self._tp_matches(existing, canonical_price) for existing in filled_tp_points):
+            return self.get_remaining_tp_points(thread_id)
+
+        filled_tp_points.append(canonical_price)
+        self.conn.execute(
+            "UPDATE trade_threads SET filled_tp_points_json=?, updated_at=? WHERE thread_id=?",
+            (
+                json.dumps(filled_tp_points, ensure_ascii=False, default=str),
+                self._now_iso(),
+                thread_id,
+            ),
+        )
+        self.conn.commit()
+        return self.get_remaining_tp_points(thread_id)
 
     def set_trade_thread_status(self, thread_id: int, status: str) -> None:
         self.conn.execute(
@@ -830,6 +966,12 @@ class SQLiteStore:
         if row is None:
             return None
         return self.get_trade_thread(int(row["thread_id"]))
+
+    @staticmethod
+    def _tp_matches(lhs: float, rhs: float) -> bool:
+        left = float(lhs)
+        right = float(rhs)
+        return abs(left - right) <= max(1e-9, abs(left) * 1e-6, abs(right) * 1e-6)
 
     def count_thread_actions(
         self,
@@ -892,55 +1034,93 @@ class SQLiteStore:
         self,
         *,
         thread_id: int,
+        chat_id: int,
         message_id: int,
         is_root: bool,
         kind: str,
     ) -> None:
         self.conn.execute(
             """
-            INSERT OR IGNORE INTO thread_messages(thread_id, message_id, is_root, kind, created_at)
-            VALUES(?,?,?,?,?)
+            INSERT OR IGNORE INTO thread_messages(thread_id, chat_id, message_id, is_root, kind, created_at)
+            VALUES(?,?,?,?,?,?)
             """,
-            (thread_id, message_id, 1 if is_root else 0, kind, self._now_iso()),
+            (thread_id, chat_id, message_id, 1 if is_root else 0, kind, self._now_iso()),
         )
         self.conn.commit()
 
-    def resolve_thread_root_by_message(self, message_id: int) -> int | None:
+    def resolve_thread_root_by_message(self, *, chat_id: int, message_id: int) -> int | None:
         cur = self.conn.cursor()
         cur.execute(
             """
             SELECT thread_id
             FROM thread_messages
-            WHERE message_id=?
+            WHERE chat_id=? AND message_id=?
+            LIMIT 1
+            """,
+            (chat_id, message_id),
+        )
+        row = cur.fetchone()
+        if row is not None:
+            return int(row["thread_id"])
+
+        # Backward compatibility for legacy rows without chat_id.
+        cur.execute(
+            """
+            SELECT thread_id
+            FROM thread_messages
+            WHERE chat_id=0 AND message_id=?
             LIMIT 1
             """,
             (message_id,),
         )
         row = cur.fetchone()
-        if row is None:
-            return None
-        return int(row["thread_id"])
+        return int(row["thread_id"]) if row is not None else None
 
-    def resolve_thread_root_by_reply(self, reply_to_msg_id: int | None) -> int | None:
+    def resolve_thread_root_by_reply(
+        self,
+        *,
+        chat_id: int,
+        reply_to_msg_id: int | None,
+        reply_to_chat_id: int | None = None,
+    ) -> int | None:
         if reply_to_msg_id is None:
             return None
+        candidates: list[int] = []
+        seen: set[int] = set()
+        for raw_chat_id in (reply_to_chat_id, chat_id):
+            if raw_chat_id is None:
+                continue
+            for cid in self._chat_id_variants(int(raw_chat_id)):
+                if cid in seen:
+                    continue
+                seen.add(cid)
+                candidates.append(cid)
+        for candidate_chat_id in candidates:
+            thread_id = self.resolve_thread_root_by_message(chat_id=candidate_chat_id, message_id=reply_to_msg_id)
+            if thread_id is not None:
+                return thread_id
+
+        # Backward compatibility for historical single-channel thread_id=message_id mapping.
         cur = self.conn.cursor()
-        cur.execute(
-            """
-            SELECT thread_id
-            FROM trade_threads
-            WHERE thread_id=?
-            LIMIT 1
-            """,
-            (reply_to_msg_id,),
-        )
+        cur.execute("SELECT thread_id FROM trade_threads WHERE thread_id=? LIMIT 1", (reply_to_msg_id,))
         row = cur.fetchone()
-        if row is not None:
-            return int(row["thread_id"])
-        return self.resolve_thread_root_by_message(reply_to_msg_id)
+        return int(row["thread_id"]) if row is not None else None
 
     def close(self) -> None:
         self.conn.close()
+
+    @staticmethod
+    def _chat_id_variants(chat_id: int) -> set[int]:
+        variants = {int(chat_id)}
+        cid = int(chat_id)
+        if cid >= 0:
+            return variants
+        abs_id = str(abs(cid))
+        if abs_id.startswith("100") and len(abs_id) >= 11:
+            variants.add(-int(abs_id[3:]))
+        elif len(abs_id) >= 10:
+            variants.add(-int(f"100{abs_id}"))
+        return variants
 
     @staticmethod
     def _json(payload: Any) -> dict[str, Any]:

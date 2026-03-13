@@ -72,7 +72,7 @@ def _config() -> AppConfig:
     )
 
 
-def test_sl_autofix_fail_triggers_protective_close_and_safe_mode(tmp_path) -> None:
+def test_sl_autofix_fail_triggers_protective_close_without_safe_mode_block(tmp_path) -> None:
     store = SQLiteStore(str(tmp_path / "daemon.db"))
     alerts = AlertManager(Notifier(logging.getLogger("test")), store, logging.getLogger("test"))
     state = StateStore()
@@ -108,7 +108,7 @@ def test_sl_autofix_fail_triggers_protective_close_and_safe_mode(tmp_path) -> No
     asyncio.run(daemon.tick_once())
 
     assert bitget.close_calls == 1
-    assert state.safe_mode is True
+    assert state.safe_mode is False
 
     row = store.conn.execute(
         "SELECT action, reason FROM reconciler_actions WHERE action='PROTECTIVE_CLOSE_EXECUTED' ORDER BY id DESC LIMIT 1"

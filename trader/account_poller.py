@@ -107,12 +107,11 @@ class AccountPoller:
 
             if position.unknown_origin:
                 unknown_symbols_now.add(symbol)
-                self.state.enable_safe_mode(f"unknown position detected on exchange: {symbol}")
                 if symbol not in self._unknown_position_active:
                     self.alerts.warn(
                         "UNKNOWN_POSITION",
-                        "exchange reports unknown position; blocking new entries",
-                        {"symbol": symbol, "size": size, "side": side},
+                        "exchange reports unknown position; notify only",
+                        {"symbol": symbol, "size": size, "side": side, "impact": "notify_only"},
                     )
                     self._unknown_position_active.add(symbol)
 
@@ -126,13 +125,24 @@ class AccountPoller:
                     "unknown position state recovered",
                     {"symbol": symbol},
                 )
+            # Release unknown-position safe mode once all unknown positions are gone.
+            if not self._unknown_position_active:
+                reason = str(self.state.block_new_entries_reason or "")
+                if reason.startswith("unknown position detected on exchange:"):
+                    self.state.disable_safe_mode()
+                    self.alerts.info(
+                        "UNKNOWN_POSITION_SAFE_MODE_RELEASED",
+                        "safe mode released after unknown positions recovered",
+                        {"reason": "unknown_position_recovered"},
+                    )
 
         new_symbols = {p.symbol for p in parsed_positions}
         cleared = old_symbols - new_symbols
         for symbol in cleared:
-            self.state.clear_orders_for_symbol(symbol)
             prev = old_positions.get(symbol)
             thread_id = self.store.find_latest_thread_id_by_symbol(symbol)
+            cancel_summary = self._cancel_entry_orders_on_position_clear(symbol, thread_id)
+            self.state.clear_orders_for_symbol(symbol)
             if thread_id is not None:
                 self.store.set_trade_thread_status(thread_id, "CLOSED")
 
@@ -159,13 +169,95 @@ class AccountPoller:
             self.alerts.info(
                 "POSITION_CLEARED",
                 "position no longer exists on exchange; cleared local order state",
-                {"symbol": symbol},
+                {
+                    "symbol": symbol,
+                    "entry_cancel_attempted": cancel_summary["attempted"],
+                    "entry_cancel_succeeded": cancel_summary["canceled"],
+                    "entry_cancel_failed": cancel_summary["failed"],
+                },
             )
             self.alerts.info(
                 "POSITION_CLOSED_SUMMARY",
                 "position closed summary",
                 payload,
             )
+
+    def _cancel_entry_orders_on_position_clear(self, symbol: str, thread_id: int | None) -> dict[str, int]:
+        """Best-effort one-shot cleanup for lingering entry orders when a position is fully closed."""
+        rows: list[dict] = []
+        try:
+            rows.extend(self.bitget.get_open_orders() or [])
+        except Exception as exc:  # noqa: BLE001
+            self.state.register_api_error()
+            self.alerts.warn(
+                "POSITION_CLEAR_CANCEL_SCAN_FAILED",
+                "failed to scan open orders during position-clear cleanup",
+                {"symbol": symbol, "error": str(exc)},
+            )
+            return {"attempted": 0, "canceled": 0, "failed": 0}
+
+        if hasattr(self.bitget, "list_plan_orders"):
+            try:
+                rows.extend(self.bitget.list_plan_orders() or [])
+            except Exception as exc:  # noqa: BLE001
+                self.state.register_api_error()
+                self.alerts.warn(
+                    "POSITION_CLEAR_CANCEL_SCAN_FAILED",
+                    "failed to scan plan orders during position-clear cleanup",
+                    {"symbol": symbol, "error": str(exc)},
+                )
+
+        attempted = 0
+        canceled = 0
+        failed = 0
+        seen: set[tuple[bool, str | None, str | None]] = set()
+        symbol_upper = symbol.upper()
+        for row in rows:
+            row_symbol = str(row.get("symbol") or "").upper()
+            if row_symbol != symbol_upper:
+                continue
+            if self._infer_purpose(row) != "entry":
+                continue
+            order_id = str(row.get("orderId") or "") or None
+            client_oid = str(row.get("clientOid") or "") or None
+            is_plan_order = bool(row.get("planType") or row.get("triggerType"))
+            key = (is_plan_order, order_id, client_oid)
+            if key in seen:
+                continue
+            seen.add(key)
+            attempted += 1
+            try:
+                if is_plan_order and hasattr(self.bitget, "cancel_plan_order"):
+                    self.bitget.cancel_plan_order(symbol=symbol_upper, order_id=order_id, client_oid=client_oid)
+                elif order_id:
+                    self.bitget.cancel_order(symbol_upper, order_id)
+                else:
+                    raise RuntimeError("missing order_id for non-plan order cancel")
+                canceled += 1
+                self.store.record_reconciler_action(
+                    symbol=symbol_upper,
+                    order_id=order_id,
+                    client_order_id=client_oid,
+                    action="POSITION_CLEAR_CANCEL_ENTRY",
+                    reason="position_cleared",
+                    payload={"is_plan_order": is_plan_order},
+                    thread_id=thread_id,
+                    purpose="entry",
+                )
+            except Exception as exc:  # noqa: BLE001
+                failed += 1
+                self.state.register_api_error()
+                self.store.record_reconciler_action(
+                    symbol=symbol_upper,
+                    order_id=order_id,
+                    client_order_id=client_oid,
+                    action="POSITION_CLEAR_CANCEL_ENTRY_FAILED",
+                    reason=str(exc),
+                    payload={"is_plan_order": is_plan_order},
+                    thread_id=thread_id,
+                    purpose="entry",
+                )
+        return {"attempted": attempted, "canceled": canceled, "failed": failed}
 
     async def poll_open_orders(self) -> None:
         raw_orders = await asyncio.to_thread(self.bitget.get_open_orders)
@@ -196,7 +288,9 @@ class AccountPoller:
                 symbol=symbol,
                 side=side,
                 status=str(row.get("state", row.get("status", "NEW"))),
-                filled=float(row.get("baseVolume", row.get("filledQty", 0.0)) or 0.0),
+                # Bitget open-orders payload may use baseVolume as order quantity.
+                # Use explicit filled fields to avoid misclassifying pending orders as filled.
+                filled=self._to_float(row, ["filledQty", "filledSize", "dealSize", "accBaseVolume"]) or 0.0,
                 quantity=self._to_float(row, ["size", "qty", "baseVolume"]),
                 avg_price=self._to_float(row, ["priceAvg", "avgPrice"]),
                 reduce_only=str(row.get("reduceOnly", "NO")).upper() == "YES",
@@ -254,7 +348,10 @@ class AccountPoller:
         trade_side = str(row.get("tradeSide") or "").lower()
         reduce_only = str(row.get("reduceOnly", "NO")).upper() == "YES"
         if reduce_only or trade_side == "close":
-            return "sl"
+            # Generic close-type plan order. We avoid forcing it to "sl" because
+            # normal_plan close orders may actually be TP, and mislabeling can
+            # trigger duplicate TP placement loops.
+            return "close"
         return "entry"
 
     def _resolve_order_purpose(self, row: dict, existing: OrderState | None) -> str:

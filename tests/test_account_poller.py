@@ -96,6 +96,73 @@ class FakeBitgetOpenOrdersMetadata(FakeBitget):
         ]
 
 
+class FakeBitgetUnknownThenClear(FakeBitget):
+    def __init__(self) -> None:
+        self._calls = 0
+
+    def get_positions(self):
+        self._calls += 1
+        if self._calls == 1:
+            return super().get_positions()
+        return []
+
+
+class FakeBitgetNoPositionWithOpenEntries(FakeBitgetNoPosition):
+    def __init__(self) -> None:
+        self.canceled_spot: list[tuple[str, str]] = []
+        self.canceled_plan: list[tuple[str, str | None, str | None]] = []
+
+    def get_open_orders(self):
+        return [
+            {
+                "symbol": "BTCUSDT",
+                "side": "buy",
+                "state": "live",
+                "orderId": "E-1001",
+                "clientOid": "manual-entry-1",
+                "reduceOnly": "NO",
+            },
+            {
+                "symbol": "BTCUSDT",
+                "side": "sell",
+                "state": "live",
+                "orderId": "TP-1002",
+                "clientOid": "tp-88-0-abc",
+                "reduceOnly": "YES",
+                "tradeSide": "close",
+            },
+        ]
+
+    def list_plan_orders(self):
+        return [
+            {
+                "symbol": "BTCUSDT",
+                "side": "buy",
+                "orderId": "P-1003",
+                "clientOid": "legacy-plan-entry",
+                "planType": "normal_plan",
+                "reduceOnly": "NO",
+            },
+            {
+                "symbol": "BTCUSDT",
+                "side": "sell",
+                "orderId": "SL-1004",
+                "clientOid": "sl-88-xyz",
+                "planType": "loss_plan",
+                "reduceOnly": "YES",
+                "tradeSide": "close",
+            },
+        ]
+
+    def cancel_order(self, symbol: str, order_id: str):
+        self.canceled_spot.append((symbol, order_id))
+        return {"ok": True}
+
+    def cancel_plan_order(self, *, symbol: str, order_id: str | None = None, client_oid: str | None = None):
+        self.canceled_plan.append((symbol, order_id, client_oid))
+        return {"ok": True}
+
+
 def _config() -> AppConfig:
     return AppConfig.model_validate(
         {
@@ -230,6 +297,58 @@ def test_account_poller_emits_position_closed_summary(tmp_path) -> None:
     assert thread["status"] == "CLOSED"
 
 
+def test_position_clear_cancels_entry_orders_once(tmp_path) -> None:
+    store = SQLiteStore(str(tmp_path / "monitor_close_cancel.db"))
+    alerts = AlertManager(Notifier(logging.getLogger("test")), store, logging.getLogger("test"))
+    state = StateStore()
+    state.set_account(equity=1300.0, available=1100.0, margin_used=200.0)
+    state.set_positions(
+        [
+            PositionState(
+                symbol="BTCUSDT",
+                side="long",
+                size=0.02,
+                entry_price=100000.0,
+                mark_price=101000.0,
+                liq_price=90000.0,
+                pnl=20.0,
+                leverage=5,
+                margin_mode="isolated",
+                timestamp=utc_now(),
+                opened_at=utc_now(),
+            )
+        ]
+    )
+    store.upsert_trade_thread(
+        thread_id=88,
+        symbol="BTCUSDT",
+        side="LONG",
+        leverage=10,
+        status="ACTIVE",
+    )
+
+    bitget = FakeBitgetNoPositionWithOpenEntries()
+    poller = AccountPoller(_config(), bitget, state, store, alerts)
+    asyncio.run(poller.poll_positions())
+
+    assert bitget.canceled_spot == [("BTCUSDT", "E-1001")]
+    assert bitget.canceled_plan == [("BTCUSDT", "P-1003", "legacy-plan-entry")]
+
+    rows = store.conn.execute(
+        "SELECT action, order_id FROM reconciler_actions WHERE action='POSITION_CLEAR_CANCEL_ENTRY' ORDER BY id ASC"
+    ).fetchall()
+    assert len(rows) == 2
+
+    event = store.conn.execute(
+        "SELECT payload_json FROM events WHERE type='POSITION_CLEARED' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert event is not None
+    payload = json.loads(str(event["payload_json"]))
+    assert payload["entry_cancel_attempted"] == 2
+    assert payload["entry_cancel_succeeded"] == 2
+    assert payload["entry_cancel_failed"] == 0
+
+
 def test_poll_open_orders_preserves_existing_thread_context(tmp_path) -> None:
     store = SQLiteStore(str(tmp_path / "monitor_open_order_merge.db"))
     alerts = AlertManager(Notifier(logging.getLogger("test")), store, logging.getLogger("test"))
@@ -290,6 +409,30 @@ def test_unknown_position_alert_emits_once_while_persistent(tmp_path) -> None:
     assert len(rows) == 1
 
 
+def test_unknown_position_recovery_does_not_enable_safe_mode(tmp_path) -> None:
+    store = SQLiteStore(str(tmp_path / "monitor_unknown_recovery.db"))
+    alerts = AlertManager(Notifier(logging.getLogger("test")), store, logging.getLogger("test"))
+    state = StateStore()
+    poller = AccountPoller(_config(), FakeBitgetUnknownThenClear(), state, store, alerts)
+
+    asyncio.run(poller.poll_positions())
+    assert state.safe_mode is False
+    assert state.block_new_entries_reason is None
+
+    asyncio.run(poller.poll_positions())
+    assert state.safe_mode is False
+    assert state.block_new_entries_reason is None
+
+    recovered = store.conn.execute(
+        "SELECT id FROM events WHERE type='UNKNOWN_POSITION_RECOVERED' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    released = store.conn.execute(
+        "SELECT id FROM events WHERE type='UNKNOWN_POSITION_SAFE_MODE_RELEASED' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert recovered is not None
+    assert released is None
+
+
 def test_infer_purpose_prefers_tp_client_oid_prefix() -> None:
     row = {
         "clientOid": "tp-13-2-1772417536",
@@ -315,3 +458,12 @@ def test_infer_purpose_uses_normal_plan_preset_fields() -> None:
     }
     assert AccountPoller._infer_purpose(tp_row) == "tp"
     assert AccountPoller._infer_purpose(sl_row) == "sl"
+
+
+def test_infer_purpose_close_order_defaults_to_close() -> None:
+    row = {
+        "planType": "normal_plan",
+        "reduceOnly": "NO",
+        "tradeSide": "close",
+    }
+    assert AccountPoller._infer_purpose(row) == "close"
