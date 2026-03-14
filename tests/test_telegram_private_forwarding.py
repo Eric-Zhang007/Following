@@ -10,8 +10,12 @@ pytest.importorskip("telethon")
 from trader.telegram_private_listener import TelegramPrivateListener
 
 
-def _listener(cfg: TelegramConfig) -> TelegramPrivateListener:
-    return TelegramPrivateListener(cfg, logger=logging.getLogger("test.telegram.forward"))
+def _listener(cfg: TelegramConfig, control_usernames: list[str] | None = None) -> TelegramPrivateListener:
+    return TelegramPrivateListener(
+        cfg,
+        logger=logging.getLogger("test.telegram.forward"),
+        control_usernames=control_usernames,
+    )
 
 
 def test_forward_source_id_matches_short_and_prefixed_variants() -> None:
@@ -86,3 +90,16 @@ def test_reply_peer_to_chat_id_maps_channel_peer() -> None:
         channel_id = 3831751615
 
     assert TelegramPrivateListener._reply_peer_to_chat_id(_Peer()) == -1003831751615
+
+
+def test_listener_chats_include_control_usernames() -> None:
+    cfg = TelegramConfig(
+        api_id=1,
+        api_hash="x",
+        channel_id=-1003831751615,
+    )
+    listener = _listener(cfg, control_usernames=["@aa3845226"])
+
+    chats = listener._listener_chats()
+
+    assert "@aa3845226" in chats

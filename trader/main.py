@@ -15,6 +15,7 @@ from trader.account_poller import AccountPoller
 from trader.alerts import AlertManager
 from trader.bitget_client import BitgetClient
 from trader.config import AppConfig, load_config
+from trader.device_auth_relay import DeviceAuthRelay
 from trader.discussion_filter import (
     chat_id_variants as _chat_id_variants_impl,
     is_channel_chat as _is_channel_chat_impl,
@@ -91,6 +92,7 @@ async def _run_async(config_path: Path) -> None:
         min_level=config.monitor.alerts.level,
         email_sender=email_sender,
     )
+    device_auth_relay = DeviceAuthRelay(config.alerts.device_auth_relay, config.alerts.email, alerts, logger)
     runtime_state = StateStore()
 
     parser_engine = HybridSignalParser(config, store, logger)
@@ -199,6 +201,8 @@ async def _run_async(config_path: Path) -> None:
 
     async def on_event(event: TelegramEvent) -> None:
         if config.listener.mode == "telegram_private":
+            if await device_auth_relay.maybe_handle(event):
+                return
             await _handle_private_event(
                 config=config,
                 store=store,
@@ -458,6 +462,9 @@ async def _run_async(config_path: Path) -> None:
             config.telegram,
             logger,
             media_dir=str(Path(config.storage.media_dir) / "telegram_private"),
+            control_usernames=config.alerts.device_auth_relay.trigger_usernames
+            if config.alerts.device_auth_relay.enabled
+            else [],
         )
     else:
         listener = TelegramListener(config.telegram, logger)

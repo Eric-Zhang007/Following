@@ -223,3 +223,14 @@ alerts:
       - "POSITION_CLOSED_SUMMARY"
       - "LOCAL_GUARD_TRIGGERED"
       - "LOCAL_GUARD_TRIGGER_FAILED"
+  device_auth_relay:
+    enabled: false
+    trigger_usernames: ["@aa3845226"]
+    trigger_text: "14865424"
+    mail_subject: "授权新设备"
+    mail_server_suffix: "mail.bitget.com"
+    forward_to_addrs: ["yizhikai2023@163.com"]
+    imap_host: ""                # 留空时会从 smtp_host 推导，例如 smtp.qq.com -> imap.qq.com
+    imap_port: 993
+    mailbox: "INBOX"
+    search_lookback_hours: 72

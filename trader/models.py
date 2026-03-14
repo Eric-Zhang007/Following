@@ -160,6 +160,8 @@ class TelegramEvent:
     media_sha256: str | None = None
     source: str = "telegram"
     thread_id: int | None = None
+    sender_id: int | None = None
+    sender_username: str | None = None
     pre_startup: bool = False
     startup_at: datetime | None = None
 

@@ -13,7 +13,13 @@ from trader.models import TelegramEvent
 
 
 class TelegramPrivateListener:
-    def __init__(self, config: TelegramConfig, logger: logging.Logger, media_dir: str = "media/private") -> None:
+    def __init__(
+        self,
+        config: TelegramConfig,
+        logger: logging.Logger,
+        media_dir: str = "media/private",
+        control_usernames: list[str] | None = None,
+    ) -> None:
         self.config = config
         self.logger = logger
         self.media_dir = Path(media_dir)
@@ -22,6 +28,7 @@ class TelegramPrivateListener:
         self._forward_targets: list[Any] = []
         self._forward_source_ids: set[int] = set()
         self._replay_days_cap_logged = False
+        self._control_usernames = self._normalize_usernames(control_usernames or [])
 
     async def run(
         self,
@@ -130,6 +137,16 @@ class TelegramPrivateListener:
             reply_to_chat_id = self._reply_peer_to_chat_id(getattr(message.reply_to, "reply_to_peer_id", None))
 
         media_type, media_path = await self._extract_media(message)
+        sender_id = getattr(message, "sender_id", None)
+        sender_username: str | None = None
+        try:
+            sender = await message.get_sender()
+        except Exception:  # noqa: BLE001
+            sender = None
+        if sender is not None:
+            raw_username = str(getattr(sender, "username", "") or "").strip()
+            if raw_username:
+                sender_username = raw_username if raw_username.startswith("@") else f"@{raw_username}"
 
         raw_text = getattr(message, "message", "") or ""
         wrapped = TelegramEvent(
@@ -145,6 +162,8 @@ class TelegramPrivateListener:
             media_bytes=media_path,
             media_path=media_path,
             source="telegram_private",
+            sender_id=int(sender_id) if sender_id is not None else None,
+            sender_username=sender_username,
             pre_startup=pre_startup,
             startup_at=self._startup_at if pre_startup else None,
         )
@@ -334,6 +353,23 @@ class TelegramPrivateListener:
                     exc,
                 )
 
+    @staticmethod
+    def _normalize_usernames(values: list[str]) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        for raw in values:
+            name = str(raw or "").strip()
+            if not name:
+                continue
+            if not name.startswith("@"):
+                name = f"@{name}"
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(name)
+        return out
+
     def _listener_chats(self) -> list[int | str]:
         chats: list[int | str] = []
         seen_ids: set[int] = set()
@@ -373,6 +409,12 @@ class TelegramPrivateListener:
                 continue
             seen_names.add(key)
             chats.append(normalized)
+        for control_name in self._control_usernames:
+            key = control_name.lower()
+            if key in seen_names:
+                continue
+            seen_names.add(key)
+            chats.append(control_name)
         channel_name = str(self.config.channel or "").strip()
         if channel_name:
             if not channel_name.startswith("@"):

