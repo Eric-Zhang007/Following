@@ -48,17 +48,17 @@ class _FakeIMAP:
             b"1": _mail_bytes(
                 subject="授权新设备",
                 date="Fri, 14 Mar 2026 00:01:00 +0000",
-                received_domain="mx01.mail.bitget.com",
+                from_addr="noreply@bitget.com",
             ),
             b"2": _mail_bytes(
                 subject="授权新设备",
                 date="Fri, 14 Mar 2026 00:03:00 +0000",
-                received_domain="other.example.com",
+                from_addr="noreply@example.com",
             ),
             b"3": _mail_bytes(
                 subject="授权新设备",
                 date="Fri, 14 Mar 2026 00:02:30 +0000",
-                received_domain="relay02.mail.bitget.com",
+                from_addr="support@send007.mail.bitget.com",
             ),
         }
 
@@ -81,12 +81,12 @@ class _FakeIMAP:
         return "OK", [(b"RFC822", self.messages[message_id])]
 
 
-def _mail_bytes(*, subject: str, date: str, received_domain: str) -> bytes:
+def _mail_bytes(*, subject: str, date: str, from_addr: str, received_domain: str = "mx.qq.com") -> bytes:
     msg = email.message.EmailMessage()
     msg["Subject"] = subject
     msg["Date"] = date
     msg["Received"] = f"from {received_domain} (unknown [{received_domain}]) by mx.qq.com"
-    msg["From"] = "noreply@bitget.com"
+    msg["From"] = from_addr
     msg["To"] = "1145106531@qq.com"
     msg.set_content("bitget auth")
     return msg.as_bytes()
@@ -141,7 +141,7 @@ def test_device_auth_relay_picks_nearest_bitget_mail_and_forwards(monkeypatch, t
     )
 
     assert outcome.status == "FORWARDED"
-    assert outcome.matched_server == "relay02.mail.bitget.com"
+    assert outcome.matched_server == "send007.mail.bitget.com"
     assert len(_FakeSMTP.sent_messages) == 1
     sent = _FakeSMTP.sent_messages[0]
     assert sent["To"] == "yizhikai2023@163.com"
@@ -159,7 +159,7 @@ def test_device_auth_relay_ignores_non_matching_sender_domain(monkeypatch, tmp_p
                 b"1": _mail_bytes(
                     subject="授权新设备",
                     date="Fri, 14 Mar 2026 00:02:00 +0000",
-                    received_domain="mx01.example.com",
+                    from_addr="noreply@example.com",
                 )
             }
 

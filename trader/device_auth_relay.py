@@ -12,6 +12,7 @@ from email import policy
 from email.header import decode_header
 from email.message import EmailMessage
 from email.parser import BytesParser
+from email.utils import getaddresses
 from email.utils import parsedate_to_datetime
 
 from trader.alerts import AlertManager
@@ -142,7 +143,7 @@ class DeviceAuthRelay:
                 subject = self._decode_subject(message)
                 if not subject or str(self.config.mail_subject or "").strip() not in subject:
                     continue
-                matched_server = self._match_server_domain(message)
+                matched_server = self._match_sender_domain(message)
                 if matched_server is None:
                     continue
                 mail_date = self._extract_mail_date(message)
@@ -233,15 +234,16 @@ class DeviceAuthRelay:
             value = value.replace(tzinfo=timezone.utc)
         return value.astimezone(timezone.utc)
 
-    def _match_server_domain(self, message) -> str | None:
+    def _match_sender_domain(self, message) -> str | None:
         suffix = str(self.config.mail_server_suffix or "").strip().lower().lstrip(".")
         if not suffix:
             return None
-        for header in message.get_all("Received", []):
-            for raw_domain in _DOMAIN_RE.findall(str(header or "")):
-                domain = raw_domain.lower().strip(".")
-                if domain == suffix or domain.endswith(f".{suffix}"):
-                    return domain
+        for _, addr in getaddresses(message.get_all("From", [])):
+            domain = str(addr or "").split("@")[-1].lower().strip(".")
+            if not domain:
+                continue
+            if domain == suffix or domain.endswith(f".{suffix}"):
+                return domain
         return None
 
     def _imap_host(self) -> str:
