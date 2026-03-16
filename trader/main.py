@@ -32,6 +32,7 @@ from trader.media import MediaManager
 from trader.models import EntrySignal, EntryType, ManageAction, NeedsManual, NonSignal, ParsedKind, ParsedMessage, TelegramEvent, utc_now
 from trader.notifier import Notifier
 from trader.order_reconciler import OrderReconciler
+from trader.private_manage_guards import resolve_private_fallback_symbol, should_reject_reply_manage_without_thread_symbol
 from trader.private_channel_parser import PrivateChannelParser
 from trader.price_feed import PriceFeed
 from trader.risk import RiskManager
@@ -861,7 +862,11 @@ async def _handle_private_event(
     )
 
     latest_thread = store.get_trade_thread(thread_id)
-    fallback_symbol = (latest_thread or {}).get("symbol") or store.get_last_entry_symbol(event.chat_id)
+    fallback_symbol = resolve_private_fallback_symbol(
+        latest_thread=latest_thread,
+        chat_id=event.chat_id,
+        store=store,
+    )
     parse_outcome = parser.parse(
         text=text,
         timestamp=event.date,
@@ -1282,6 +1287,33 @@ async def _handle_private_event(
     if isinstance(parsed, ManageAction):
         parsed.thread_id = thread_id
         thread = store.get_trade_thread(thread_id)
+        if should_reject_reply_manage_without_thread_symbol(
+            is_root=thread_result.is_root,
+            parsed=parsed,
+            thread=thread,
+        ):
+            store.record_execution(
+                chat_id=event.chat_id,
+                message_id=event.message_id,
+                version=message_state.version,
+                action_type="MANAGE",
+                symbol=None,
+                side=None,
+                status="REJECTED",
+                reason="reply_manage_unresolved_thread_symbol",
+                intent=_to_dict(parsed),
+                thread_id=thread_id,
+                purpose="manage",
+            )
+            store.record_event(
+                event_type="REPLY_MANAGE_UNRESOLVED_THREAD_REJECTED",
+                level="WARN",
+                msg="reply manage rejected because thread has no resolved symbol",
+                payload={"thread_id": thread_id, "message_id": event.message_id},
+                reason="reply_manage_unresolved_thread_symbol",
+                thread_id=thread_id,
+            )
+            return
         if not parsed.symbol and thread and thread.get("symbol"):
             parsed.symbol = str(thread.get("symbol"))
         if config.risk.enabled:
@@ -1352,6 +1384,8 @@ def _prestartup_stoploss_guard_reason(
     if touched:
         return f"prestartup_stop_loss_touched:{stop_loss_price:.8f}"
     return None
+
+
 
 
 def _entry_has_anchor(signal: EntrySignal) -> bool:

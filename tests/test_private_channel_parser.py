@@ -69,6 +69,30 @@ def test_private_parser_accepts_single_letter_symbol() -> None:
     assert out.parsed.side.value == "LONG"
 
 
+def test_private_parser_accepts_chinese_hashtag_symbol() -> None:
+    parser = PrivateChannelParser(_build_config())
+    text = (
+        "🖥 交易信號 🖥\n\n"
+        "#龙虾（10x做多🚀🚀🚀）\n\n"
+        "✏️進場位：市價0.017500\n\n"
+        "👁 盈利位：0.019809—0.023879—0.030354\n\n"
+        "❌止損位：0.015170"
+    )
+
+    out = parser.parse(
+        text=text,
+        timestamp=datetime(2026, 3, 16, 3, 48, 37, tzinfo=timezone.utc),
+        image_path=None,
+        fallback_symbol="ETHUSDT",
+        thread_id=125,
+        is_root=True,
+    )
+    assert isinstance(out.parsed, EntrySignal)
+    assert out.parsed.symbol == "龙虾USDT"
+    assert out.parsed.entry_type == EntryType.MARKET
+    assert out.parsed.entry_points == [0.0175]
+
+
 def test_private_parser_manage_add_defaults_to_100pct() -> None:
     parser = PrivateChannelParser(_build_config())
     out = parser.parse(

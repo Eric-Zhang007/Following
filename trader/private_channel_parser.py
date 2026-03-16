@@ -15,8 +15,8 @@ from trader.sanitize import sanitize_text
 from trader.vlm_client import VLMClient
 
 _KEYWORD_RE = re.compile(r"交易\s*信[号號]", re.IGNORECASE)
-_SYMBOL_HASH_RE = re.compile(r"#\s*([A-Za-z0-9]{1,20})(?:\s*/\s*(USDT))?", re.IGNORECASE)
-_SYMBOL_PAIR_RE = re.compile(r"([A-Za-z0-9]{1,20})\s*/\s*USDT", re.IGNORECASE)
+_SYMBOL_HASH_RE = re.compile(r"#\s*([A-Za-z0-9\u4e00-\u9fff]{1,20})(?:\s*/\s*(USDT))?", re.IGNORECASE)
+_SYMBOL_PAIR_RE = re.compile(r"([A-Za-z0-9\u4e00-\u9fff]{1,20})\s*/\s*USDT", re.IGNORECASE)
 _LEVERAGE_RE = re.compile(r"(\d{1,3})\s*[xX]\s*做?\s*(多|空)?", re.IGNORECASE)
 _SIDE_RE = re.compile(r"(做多|做空|LONG|SHORT)", re.IGNORECASE)
 _ENTRY_LINE_RE = re.compile(r"(?:進場位|进场位|入場位|入场位|進場|进场)\s*[:：]\s*([^\n\r]+)", re.IGNORECASE)
