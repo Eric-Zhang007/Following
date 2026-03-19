@@ -8,3 +8,16 @@ __pycache__/
 .env
 config.yaml
 trader.log
+
+# Runtime and backup artifacts
+backups/
+.deploy_backup_*/
+run.out
+media/
+*.bak
+*.bak_*
+*.fixbak_*
+*-wal
+*-shm
+*.db.bak*
+*.session-journal

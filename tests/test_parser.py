@@ -49,7 +49,40 @@ def test_parse_manage_reduce_with_symbol() -> None:
     assert isinstance(parsed, ManageAction)
     assert parsed.symbol == "CYBERUSDT"
     assert parsed.reduce_pct == 30
+    assert parsed.add_pct is None
     assert parsed.tp_price == 0.69
+
+
+def test_parse_manage_add_with_default_pct() -> None:
+    parser = SignalParser()
+    msg = "#CYBER/USDT 补仓，继续拿"
+    parsed = parser.parse(msg, source_key="c1")
+
+    assert isinstance(parsed, ManageAction)
+    assert parsed.symbol == "CYBERUSDT"
+    assert parsed.add_pct == 100
+    assert parsed.reduce_pct is None
+
+
+def test_parse_manage_exit_addon_phrase_prefers_reduce() -> None:
+    parser = SignalParser()
+    msg = "#CYBER/USDT 減掉補倉"
+    parsed = parser.parse(msg, source_key="c1")
+
+    assert isinstance(parsed, ManageAction)
+    assert parsed.symbol == "CYBERUSDT"
+    assert parsed.reduce_pct == 35
+    assert parsed.add_pct is None
+
+
+def test_parse_manage_reduce_without_pct_defaults_to_35() -> None:
+    parser = SignalParser()
+    msg = "#CYBER/USDT 减仓"
+    parsed = parser.parse(msg, source_key="c1")
+
+    assert isinstance(parsed, ManageAction)
+    assert parsed.symbol == "CYBERUSDT"
+    assert parsed.reduce_pct == 35
 
 
 def test_parse_manage_move_be_with_state_machine() -> None:

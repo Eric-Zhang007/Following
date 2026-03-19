@@ -75,3 +75,21 @@ def test_llm_schema_manage_reduce_pct_bounds() -> None:
     assert msg.reduce_pct == 30
     assert msg.move_sl_to_be is True
     assert msg.tp_price == 101.2
+
+
+def test_llm_schema_manage_reduce_without_pct_defaults_to_35() -> None:
+    payload = {
+        "kind": "MANAGE_ACTION",
+        "symbol": "BTCUSDT",
+        "side": None,
+        "leverage": None,
+        "entry": {"type": None, "low": None, "high": None},
+        "manage": {"reduce_pct": None, "move_sl_to_be": None, "tp": []},
+        "confidence": 0.75,
+        "notes": "",
+    }
+    parsed = LLMParsedOutput.model_validate(payload)
+    msg = parsed.to_parsed_message("#BTC 减仓", datetime.now(timezone.utc))
+
+    assert isinstance(msg, ManageAction)
+    assert msg.reduce_pct == 35

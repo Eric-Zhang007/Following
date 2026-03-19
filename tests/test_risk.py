@@ -82,14 +82,38 @@ def test_risk_clamps_leverage() -> None:
     assert decision.leverage == 10
 
 
-def test_risk_rejects_slippage_for_limit() -> None:
+def test_risk_does_not_reject_slippage_for_limit() -> None:
     config = build_config()
     manager = RiskManager(config)
     signal = build_signal(entry_low=100, entry_high=101)
 
     decision = manager.evaluate_entry(signal, current_price=110, account_equity=1000, now=utc_now(), within_cooldown=False)
+    assert decision.approved is True
+
+
+def test_risk_rejects_slippage_for_market_anchor() -> None:
+    config = build_config()
+    manager = RiskManager(config)
+    signal = build_signal(entry_type=EntryType.MARKET, entry_low=100, entry_high=100)
+
+    decision = manager.evaluate_entry(signal, current_price=130, account_equity=1000, now=utc_now(), within_cooldown=False)
     assert decision.approved is False
-    assert "deviation" in str(decision.reason)
+    assert "market anchor deviation" in str(decision.reason)
+
+
+def test_risk_market_without_anchor_uses_current_price() -> None:
+    config = build_config()
+    manager = RiskManager(config)
+    signal = build_signal(
+        entry_type=EntryType.MARKET,
+        entry_low=0,
+        entry_high=0,
+        stop_loss=90,
+    )
+
+    decision = manager.evaluate_entry(signal, current_price=100, account_equity=1000, now=utc_now(), within_cooldown=False)
+    assert decision.approved is True
+    assert decision.entry_price == 100
 
 
 def test_risk_rejects_cooldown() -> None:
