@@ -21,6 +21,8 @@ from trader.tp_allocation import remaining_tp_weights
 
 _LIGHT_POSITION_RE = re.compile(r"(?:轻仓|輕倉)", re.IGNORECASE)
 
+_LIGHT_POSITION_RE = re.compile(r"(?:轻仓|輕倉)", re.IGNORECASE)
+
 
 class TradeExecutor:
     def __init__(

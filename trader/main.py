@@ -360,6 +360,27 @@ async def _run_async(config_path: Path) -> None:
                 notifier.warning(f"{action_type} rejected by validation: {validation_error}")
                 return True
 
+            validation_error = validate_parsed_message(parsed)
+            if validation_error:
+                action_type = "ENTRY" if isinstance(parsed, EntrySignal) else "MANAGE"
+                store.record_execution(
+                    chat_id=event.chat_id,
+                    message_id=event.message_id,
+                    version=message_state.version,
+                    action_type=action_type,
+                    symbol=getattr(parsed, "symbol", None),
+                    side=getattr(getattr(parsed, "side", None), "value", None),
+                    status="REJECTED",
+                    reason=validation_error,
+                    intent={
+                        "parsed": _to_dict(parsed),
+                        "parse_source": parse_outcome.parse_source,
+                        "confidence": parse_outcome.confidence,
+                    },
+                )
+                notifier.warning(f"{action_type} rejected by validation: {validation_error}")
+                return
+
             if event.is_edit:
                 notifier.warning(
                     f"Edited message recorded (version={message_state.version}) and skipped for execution"
