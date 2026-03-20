@@ -197,6 +197,41 @@ def test_get_history_positions_parses_nested_list() -> None:
     assert rows == [{"symbol": "BTCUSDT", "netProfit": "12.3"}]
 
 
+def test_get_plan_order_state_prefers_history_trigger_order_match() -> None:
+    config = BitgetConfig(
+        base_url="https://api.bitget.com",
+        api_key="k",
+        api_secret="s",
+        passphrase="p",
+        product_type="USDT-FUTURES",
+    )
+    client = BitgetClient(config)
+
+    def fake_request(method, path, params=None, body=None, auth=False):  # noqa: ANN001
+        assert auth is True
+        if path == "/api/v2/mix/order/orders-plan-pending":
+            return {"entrustedList": None, "endId": None}
+        if path == "/api/v2/mix/order/orders-plan-history":
+            return {
+                "entrustedList": [
+                    {
+                        "orderId": "abc123",
+                        "clientOid": "tp-1",
+                        "symbol": "PIPPINUSDT",
+                        "planType": params.get("planType"),
+                        "executeStatus": "executed",
+                    }
+                ]
+            }
+        raise AssertionError(path)
+
+    client._request = fake_request  # type: ignore[method-assign]
+    row = client.get_plan_order_state(symbol="PIPPINUSDT", order_id="abc123")
+
+    assert row["orderId"] == "abc123"
+    assert row["state"] == "FILLED"
+
+
 def test_place_take_profit_fallbacks_to_normal_plan_on_400172() -> None:
     config = BitgetConfig(
         base_url="https://api.bitget.com",

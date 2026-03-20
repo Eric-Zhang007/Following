@@ -633,11 +633,116 @@ class BitgetClient:
                 return item
             if client_order_id and str(item.get("clientOid") or "") == str(client_order_id):
                 return item
+        history_item = self.get_history_plan_order_state(
+            symbol=symbol,
+            order_id=order_id,
+            client_order_id=client_order_id,
+        )
+        if history_item:
+            return history_item
         if order_id:
             return {"orderId": order_id, "state": "FILLED_OR_CLOSED"}
         if client_order_id:
             return {"clientOid": client_order_id, "state": "FILLED_OR_CLOSED"}
         raise ValueError("order_id or client_order_id required")
+
+    def get_history_plan_order_state(
+        self,
+        *,
+        symbol: str,
+        order_id: str | None = None,
+        client_order_id: str | None = None,
+        lookback_hours: int = 72,
+    ) -> dict[str, Any] | None:
+        if not order_id and not client_order_id:
+            raise ValueError("order_id or client_order_id required")
+
+        end_time = datetime.now(timezone.utc)
+        start_time = end_time - timedelta(hours=max(1, int(lookback_hours)))
+        for plan_type in ("profit_plan", "normal_plan", "track_plan"):
+            for item in self._list_history_plan_orders_by_type(
+                symbol=symbol,
+                plan_type=plan_type,
+                start_time=start_time,
+                end_time=end_time,
+            ):
+                if order_id and str(item.get("orderId") or "") != str(order_id):
+                    continue
+                if client_order_id and str(item.get("clientOid") or "") != str(client_order_id):
+                    continue
+                state = self._coerce_history_plan_state(item)
+                row = dict(item)
+                if state:
+                    row["state"] = state
+                return row
+        return None
+
+    def _list_history_plan_orders_by_type(
+        self,
+        *,
+        symbol: str,
+        plan_type: str,
+        start_time: datetime,
+        end_time: datetime,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {
+            "productType": self.config.product_type,
+            "planType": plan_type,
+            "symbol": symbol,
+            "startTime": str(int(start_time.timestamp() * 1000)),
+            "endTime": str(int(end_time.timestamp() * 1000)),
+            "limit": "100",
+        }
+        try:
+            data = self._request("GET", "/api/v2/mix/order/orders-plan-history", params=params, auth=True)
+        except Exception as exc:  # noqa: BLE001
+            message = str(exc).lower()
+            if "40812" in message or "condition plantype is not met" in message:
+                return []
+            if "400172" in message and "parameter verification failed" in message:
+                fallback_params = {
+                    "productType": self.config.product_type,
+                    "symbol": symbol,
+                    "startTime": params["startTime"],
+                    "endTime": params["endTime"],
+                    "limit": "100",
+                }
+                data = self._request("GET", "/api/v2/mix/order/orders-plan-history", params=fallback_params, auth=True)
+            else:
+                return []
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            if isinstance(data.get("entrustedList"), list):
+                return data["entrustedList"]
+            if isinstance(data.get("list"), list):
+                return data["list"]
+            if any(
+                data.get(key) not in (None, "")
+                for key in ("orderId", "clientOid", "symbol", "planType", "triggerPrice", "state", "status")
+            ):
+                return [data]
+            return []
+        return []
+
+    @staticmethod
+    def _coerce_history_plan_state(item: dict[str, Any]) -> str | None:
+        candidates = [
+            item.get("state"),
+            item.get("status"),
+            item.get("planStatus"),
+            item.get("executeStatus"),
+            item.get("orderStatus"),
+        ]
+        for raw in candidates:
+            if raw in {None, ""}:
+                continue
+            text = str(raw).strip().upper()
+            if text in {"EXECUTED", "EXECUTE_SUCCESS", "SUCCESS", "TRIGGERED", "FILLED", "DONE"}:
+                return "FILLED"
+            if text in {"CANCELLED", "CANCELED", "CANCEL", "FAIL_EXECUTE", "FAILED", "FAIL"}:
+                return "CANCELED"
+        return None
 
     def get_open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
         params: dict[str, Any] = {"productType": self.config.product_type}
