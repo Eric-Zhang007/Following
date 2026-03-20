@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 
 from trader.config import AppConfig
-from trader.models import EntrySignal, EntryType, ManageAction
+from trader.models import EntrySignal, EntryType, ManageAction, NeedsManual
 from trader.private_channel_parser import PrivateChannelParser
 
 
@@ -307,3 +307,49 @@ def test_private_parser_llm_retry_once_on_schema_failure() -> None:
     assert out.parse_source == "LLM_PRIVATE"
     assert out.parsed.symbol == "PHAUSDT"
     assert out.parsed.side.value == "SHORT"
+
+
+def test_private_parser_resolves_nonstandard_chinese_symbol_with_llm() -> None:
+    parser = PrivateChannelParser(_build_config())
+    parser._llm = _FakeLLM()
+    out = parser.parse(
+        text=(
+            "🖥 交易信號 🖥\n\n"
+            "#龙虾 (10x做多🚀🚀🚀)\n\n"
+            "✏️進場位:市價0.012258\n\n"
+            "👁 盈利位:0.013836—0.016917—0.021619\n\n"
+            " ❌止損位:0.010745"
+        ),
+        timestamp=datetime(2026, 3, 20, 1, 49, 4, tzinfo=timezone.utc),
+        image_path=None,
+        fallback_symbol=None,
+        thread_id=7221898816166467945,
+        is_root=True,
+    )
+    assert isinstance(out.parsed, EntrySignal)
+    assert out.parsed.symbol == "INXUSDT"
+    assert out.parse_source == "RULES_PRIVATE_SYMBOL_FROM_LLM_PRIVATE"
+    assert out.parsed.entry_points == [0.012258]
+    assert out.parsed.tp_points == [0.013836, 0.016917, 0.021619]
+    assert out.parsed.stop_loss == 0.010745
+
+
+def test_private_parser_nonstandard_chinese_symbol_without_resolution_goes_manual() -> None:
+    parser = PrivateChannelParser(_build_config())
+    out = parser.parse(
+        text=(
+            "🖥 交易信號 🖥\n\n"
+            "#龙虾 (10x做多🚀🚀🚀)\n\n"
+            "✏️進場位:市價0.012258\n\n"
+            "👁 盈利位:0.013836—0.016917—0.021619\n\n"
+            " ❌止損位:0.010745"
+        ),
+        timestamp=datetime(2026, 3, 20, 1, 49, 4, tzinfo=timezone.utc),
+        image_path=None,
+        fallback_symbol=None,
+        thread_id=7221898816166467945,
+        is_root=True,
+    )
+    assert isinstance(out.parsed, NeedsManual)
+    assert out.parsed.reason == "entry_symbol_requires_manual_resolution"
+    assert out.parse_source == "RULES_PRIVATE_NEEDS_MANUAL"

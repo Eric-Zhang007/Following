@@ -45,6 +45,7 @@ _SHOWCASE_TP_RE = re.compile(
     r"(?:\bTP\s*[123]\b|第\s*[一二三123]\s*止盈|止盈\s*[一二三123])",
     re.IGNORECASE,
 )
+_ENTRY_SYMBOL_RE = re.compile(r"^[A-Z0-9]+USDT$")
 _DEFAULT_REDUCE_PCT = 35.0
 
 
@@ -90,6 +91,28 @@ class PrivateChannelParser:
         if _KEYWORD_RE.search(normalized) or is_root:
             parsed, missing = self._parse_entry(normalized, timestamp=timestamp, thread_id=thread_id)
             if parsed is not None:
+                resolved = self._resolve_nonstandard_entry_symbol(
+                    parsed=parsed,
+                    text=normalized,
+                    timestamp=timestamp,
+                    image_path=image_path,
+                    fallback_symbol=fallback_symbol,
+                    thread_id=thread_id,
+                )
+                if resolved is not None:
+                    return resolved
+                if self._entry_symbol_requires_resolution(parsed.symbol):
+                    return PrivateParseOutcome(
+                        parsed=NeedsManual(
+                            kind=ParsedKind.NEEDS_MANUAL,
+                            raw_text=normalized,
+                            reason="entry_symbol_requires_manual_resolution",
+                            missing_fields=["symbol"],
+                            timestamp=timestamp,
+                        ),
+                        parse_source="RULES_PRIVATE_NEEDS_MANUAL",
+                        confidence=0.0,
+                    )
                 return PrivateParseOutcome(parsed=parsed, parse_source="RULES_PRIVATE", confidence=1.0)
             manage = self._parse_manage(normalized, timestamp=timestamp, thread_id=thread_id)
             if manage is not None:
@@ -391,6 +414,54 @@ class PrivateChannelParser:
         self._normalize_manage_defaults(action, text)
         return action
 
+    def _resolve_nonstandard_entry_symbol(
+        self,
+        *,
+        parsed: EntrySignal,
+        text: str,
+        timestamp: datetime | None,
+        image_path: str | None,
+        fallback_symbol: str | None,
+        thread_id: int | None,
+    ) -> PrivateParseOutcome | None:
+        if not self._entry_symbol_requires_resolution(parsed.symbol):
+            return None
+
+        candidates: list[PrivateParseOutcome] = []
+        if image_path and self._vlm is not None:
+            vlm = self._parse_with_vlm(
+                text=text,
+                timestamp=timestamp,
+                image_path=image_path,
+                fallback_symbol=fallback_symbol,
+                thread_id=thread_id,
+            )
+            if vlm is not None:
+                candidates.append(vlm)
+        llm = self._parse_with_llm(
+            text=text,
+            timestamp=timestamp,
+            fallback_symbol=fallback_symbol,
+            thread_id=thread_id,
+        )
+        if llm is not None:
+            candidates.append(llm)
+
+        for candidate in candidates:
+            if not isinstance(candidate.parsed, EntrySignal):
+                continue
+            if self._entry_symbol_requires_resolution(candidate.parsed.symbol):
+                continue
+            parsed.symbol = candidate.parsed.symbol
+            return PrivateParseOutcome(
+                parsed=parsed,
+                parse_source=f"RULES_PRIVATE_SYMBOL_FROM_{candidate.parse_source}",
+                confidence=float(candidate.confidence),
+                notes=candidate.notes,
+                llm_payload=candidate.llm_payload,
+            )
+        return None
+
     @staticmethod
     def _parse_showcase_reduce(
         text: str,
@@ -432,6 +503,13 @@ class PrivateChannelParser:
     @staticmethod
     def _normalize(text: str) -> str:
         return unicodedata.normalize("NFKC", text or "")
+
+    @staticmethod
+    def _entry_symbol_requires_resolution(symbol: str | None) -> bool:
+        normalized = (symbol or "").strip().upper()
+        if not normalized:
+            return True
+        return _ENTRY_SYMBOL_RE.match(normalized) is None
 
     @staticmethod
     def _extract_symbol(text: str) -> str | None:
