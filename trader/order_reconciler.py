@@ -95,11 +95,18 @@ class OrderReconciler:
             payload = await asyncio.to_thread(self._fetch_order_state, order)
             raw_status = str(payload.get("state", payload.get("status", "NEW")))
             status = self._normalize_status(raw_status)
-            if self._is_ambiguous_tp_closure(order=order, raw_status=raw_status, payload=payload):
-                status = "CANCELED"
             filled = float(payload.get("baseVolume", payload.get("filledQty", order.filled)) or 0.0)
             avg_price_raw = payload.get("priceAvg", payload.get("avgPrice"))
             avg_price = float(avg_price_raw) if avg_price_raw not in {None, ""} else order.avg_price
+            if self._is_ambiguous_tp_closure(order=order, raw_status=raw_status, payload=payload):
+                if self._should_infer_tp_fill_from_market(order):
+                    status = "FILLED"
+                    if filled <= 0:
+                        filled = float(order.quantity or order.filled or 0.0)
+                    if avg_price in {None, 0.0} and order.trigger_price is not None:
+                        avg_price = float(order.trigger_price)
+                else:
+                    status = "CANCELED"
             if self._should_cancel_stale_unfilled(order=order, status=status, filled=filled, payload=payload):
                 self._cancel_stale_order(order=order, trace=trace, payload=payload)
                 return
@@ -555,6 +562,40 @@ class OrderReconciler:
         filled = float(payload.get("baseVolume", payload.get("filledQty", 0.0)) or 0.0)
         avg_price = payload.get("priceAvg", payload.get("avgPrice"))
         return filled <= 0 and avg_price in {None, ""}
+
+    def _should_infer_tp_fill_from_market(self, order: OrderState) -> bool:
+        if order.purpose.lower() != "tp":
+            return False
+        if order.thread_id is None or order.trigger_price in {None, ""}:
+            return False
+        rearm_key = f"tp_rearm_required::{order.symbol.upper()}::{order.thread_id}"
+        if self.store.get_system_flag(rearm_key) is not None:
+            return False
+
+        position = self.state.positions.get(order.symbol.upper())
+        if position is None or float(position.size or 0.0) <= 0:
+            return False
+
+        side_hint = str(position.side or "").lower()
+        if side_hint not in {"long", "short"}:
+            thread = self.store.get_trade_thread(order.thread_id)
+            thread_side = str((thread or {}).get("side") or "").upper()
+            if thread_side == "LONG":
+                side_hint = "long"
+            elif thread_side == "SHORT":
+                side_hint = "short"
+        if side_hint not in {"long", "short"}:
+            return False
+
+        mark_price = float(position.mark_price or 0.0)
+        trigger_price = float(order.trigger_price)
+        if mark_price <= 0 or trigger_price <= 0:
+            return False
+
+        tolerance = max(1e-9, trigger_price * 1e-6)
+        if side_hint == "long":
+            return mark_price + tolerance >= trigger_price
+        return mark_price - tolerance <= trigger_price
 
     def _has_active_tp(self, symbol: str, thread_id: int | None, *, tp_points: list[float] | None = None) -> bool:
         thread = self.store.get_trade_thread(thread_id) if thread_id is not None else None

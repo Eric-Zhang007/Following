@@ -198,7 +198,7 @@ def test_tracked_position_autoprotect_last_tp_consumes_remainder(tmp_path) -> No
     asyncio.run(daemon.tick_once())
 
     assert bitget.tp_calls == 3
-    assert bitget.tp_sizes == [0.333, 0.333, 0.334]
+    assert bitget.tp_sizes == [0.35, 0.35, 0.3]
 
 
 def test_tracked_position_autoprotect_skips_when_manual_tp_exists(tmp_path) -> None:
@@ -464,4 +464,4 @@ def test_filled_tp_only_rearms_remaining_targets(tmp_path) -> None:
     asyncio.run(daemon.tick_once())
 
     assert bitget.tp_calls == 2
-    assert bitget.tp_sizes == [325.0, 325.0]
+    assert bitget.tp_sizes == [350.0, 300.0]

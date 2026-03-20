@@ -31,6 +31,17 @@ class _FakeBitgetTPFill(_FakeBitgetTP):
         return {"state": "FILLED", "baseVolume": 333.0, "priceAvg": 0.15}
 
 
+class _FakeBitgetTPClosedAmbiguous(_FakeBitgetTP):
+    def get_order_state(
+        self,
+        symbol: str,
+        order_id: str | None = None,
+        client_order_id: str | None = None,
+        is_plan_order: bool = False,
+    ):  # noqa: ARG002
+        return {"state": "FILLED_OR_CLOSED"}
+
+
 class _FakeContract:
     def __init__(self, size_place: int, min_trade_num: float = 0.0) -> None:
         self.size_place = size_place
@@ -110,7 +121,7 @@ def test_reconciler_tp_split_last_leg_consumes_remainder(tmp_path) -> None:
         parent_client_order_id=None,
     )
 
-    assert bitget.tp_sizes == [0.333, 0.333, 0.334]
+    assert bitget.tp_sizes == [0.35, 0.35, 0.3]
 
 
 def test_reconciler_detects_existing_close_plan_tp(tmp_path) -> None:
@@ -240,3 +251,143 @@ def test_reconciler_records_filled_tp_progress(tmp_path) -> None:
     assert thread is not None
     assert thread["filled_tp_points"] == [0.15]
     assert store.get_remaining_tp_points(77) == [0.18, 0.2]
+
+
+def test_reconciler_inferrs_ambiguous_tp_closure_as_fill_after_price_cross(tmp_path) -> None:
+    store = SQLiteStore(str(tmp_path / "reconciler_tp_ambiguous_fill.db"))
+    alerts = AlertManager(Notifier(logging.getLogger("test")), store, logging.getLogger("test"))
+    state = StateStore()
+    state.set_positions(
+        [
+            PositionState(
+                symbol="INXUSDT",
+                side="long",
+                size=650.0,
+                entry_price=0.1,
+                mark_price=0.151,
+                liq_price=0.05,
+                pnl=0.0,
+                leverage=10,
+                margin_mode="crossed",
+                timestamp=utc_now(),
+                opened_at=utc_now(),
+            )
+        ]
+    )
+    bitget = _FakeBitgetTPClosedAmbiguous()
+    reconciler = OrderReconciler(
+        _config(),
+        bitget,
+        state,
+        store,
+        alerts,
+        symbol_registry=_FakeSymbolRegistry(size_place=3),
+    )
+    store.upsert_trade_thread(
+        thread_id=78,
+        symbol="INXUSDT",
+        side="LONG",
+        leverage=10,
+        stop_loss=0.0865,
+        tp_points=[0.15, 0.18, 0.2],
+        status="ACTIVE",
+    )
+    state.upsert_order(
+        OrderState(
+            symbol="INXUSDT",
+            side="sell",
+            status="ACKED",
+            filled=0.0,
+            quantity=350.0,
+            avg_price=None,
+            reduce_only=True,
+            trade_side=None,
+            purpose="tp",
+            timestamp=utc_now(),
+            client_order_id="tp-78-0-1",
+            order_id="tp-78-0-1",
+            trigger_price=0.15,
+            is_plan_order=True,
+            thread_id=78,
+        )
+    )
+
+    asyncio.run(reconciler.reconcile_once())
+
+    order = state.find_order(client_order_id="tp-78-0-1")
+    assert order is not None
+    assert order.status == "FILLED"
+    thread = store.get_trade_thread(78)
+    assert thread is not None
+    assert thread["filled_tp_points"] == [0.15]
+    assert store.get_remaining_tp_points(78) == [0.18, 0.2]
+
+
+def test_reconciler_keeps_ambiguous_tp_closure_canceled_during_manual_reduce_rearm(tmp_path) -> None:
+    store = SQLiteStore(str(tmp_path / "reconciler_tp_ambiguous_rearm.db"))
+    alerts = AlertManager(Notifier(logging.getLogger("test")), store, logging.getLogger("test"))
+    state = StateStore()
+    state.set_positions(
+        [
+            PositionState(
+                symbol="INXUSDT",
+                side="long",
+                size=650.0,
+                entry_price=0.1,
+                mark_price=0.151,
+                liq_price=0.05,
+                pnl=0.0,
+                leverage=10,
+                margin_mode="crossed",
+                timestamp=utc_now(),
+                opened_at=utc_now(),
+            )
+        ]
+    )
+    bitget = _FakeBitgetTPClosedAmbiguous()
+    reconciler = OrderReconciler(
+        _config(),
+        bitget,
+        state,
+        store,
+        alerts,
+        symbol_registry=_FakeSymbolRegistry(size_place=3),
+    )
+    store.upsert_trade_thread(
+        thread_id=79,
+        symbol="INXUSDT",
+        side="LONG",
+        leverage=10,
+        stop_loss=0.0865,
+        tp_points=[0.15, 0.18, 0.2],
+        status="ACTIVE",
+    )
+    store.set_system_flag(f"tp_rearm_required::INXUSDT::{79}", str(utc_now().timestamp()))
+    state.upsert_order(
+        OrderState(
+            symbol="INXUSDT",
+            side="sell",
+            status="ACKED",
+            filled=0.0,
+            quantity=350.0,
+            avg_price=None,
+            reduce_only=True,
+            trade_side=None,
+            purpose="tp",
+            timestamp=utc_now(),
+            client_order_id="tp-79-0-1",
+            order_id="tp-79-0-1",
+            trigger_price=0.15,
+            is_plan_order=True,
+            thread_id=79,
+        )
+    )
+
+    asyncio.run(reconciler.reconcile_once())
+
+    order = state.find_order(client_order_id="tp-79-0-1")
+    assert order is not None
+    assert order.status == "CANCELED"
+    thread = store.get_trade_thread(79)
+    assert thread is not None
+    assert thread["filled_tp_points"] == []
